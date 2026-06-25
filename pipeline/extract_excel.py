@@ -12,8 +12,10 @@ import pandas as pd
 
 def _frame_to_text(df: pd.DataFrame) -> str:
     # Keep it dense and readable; don't drop rows — headers may be on any row.
+    # header=False: we read with header=None, so the real header is just row 0 of
+    # the data; don't emit pandas' synthetic "0,1,2,3" column index.
     df = df.fillna("")
-    return df.to_csv(index=False)
+    return df.to_csv(index=False, header=False)
 
 
 def extract(path: str) -> list[dict]:
