@@ -11,7 +11,7 @@ MedRate does it for you: **upload an archive → get a clean, unified, comparabl
 ## ✨ Features
 
 - 📥 **Any format in** — `.xlsx`, `.xls`, `.csv`, `.pdf` (text & scanned), `.docx`, `.png`, `.jpg`, `.jpeg`
-- 🧠 **LLM-powered extraction** — Claude AI models read each document the way a human would: understanding table structure, abbreviations, and messy layouts
+- 🧠 **LLM-powered extraction** — Google Gemini models read each document the way a human would: understanding table structure, abbreviations, and messy layouts
 - 👁️ **Vision for scans & photos** — low-quality scans and phone photos are read via vision, not brittle OCR rules
 - 🌐 **Bilingual** — handles mixed Russian / Kazakh text and preserves both
 - 🔗 **Service normalization** — the same service named differently across clinics maps to one canonical name
@@ -34,7 +34,7 @@ Archive (.zip / folder)
    Excel/CSV → table text                    │
    Text PDF  → page text                     ▼
    Scan PDF  → page images           ┌──────────────┐
-   DOCX      → text                  │  Claude LLM  │  extraction (text + vision)
+   DOCX      → text                  │  Gemini LLM  │  extraction (text + vision)
    Images    → base64                └──────────────┘
                                             │  strict JSON, temperature 0
                                             ▼
@@ -77,8 +77,8 @@ Each price line becomes one structured record:
 
 ## 🛠️ Tech stack
 
-- **Python 3.11+**
-- **Claude AI models** via the Anthropic SDK — text & vision extraction
+- **Python 3.9+**
+- **Google Gemini models** via the `google-genai` SDK — text & vision extraction (free tier available)
 - **pandas** + **openpyxl** — Excel / CSV
 - **pdfplumber** — PDF text layer
 - **pdf2image** (+ poppler) — render scanned pages
@@ -104,8 +104,8 @@ pip install -r requirements.txt
 #    macOS:  brew install poppler
 #    Linux:  apt-get install poppler-utils
 
-# 4. API key
-cp .env.example .env        # add your ANTHROPIC_API_KEY
+# 4. API key — get a free one at https://aistudio.google.com
+cp .env.example .env        # add your GEMINI_API_KEY
 
 # 5. Run
 streamlit run app.py
@@ -126,7 +126,7 @@ MedRate/
 │   ├── extract_pdf.py      # text layer vs scan detection
 │   ├── extract_docx.py     # docx → text
 │   ├── extract_image.py    # images → base64
-│   ├── llm.py              # Claude calls, retries, robust JSON parsing
+│   ├── llm.py              # Gemini calls, retries, robust JSON parsing
 │   ├── normalize.py        # prices, currency, categories
 │   └── dedup.py            # dedup & conflict handling
 ├── prompts/

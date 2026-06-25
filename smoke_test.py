@@ -1,6 +1,6 @@
 """Headless end-to-end smoke test (no Streamlit). Run from the repo root:
 
-    ANTHROPIC_API_KEY=... .venv/bin/python smoke_test.py
+    GEMINI_API_KEY=... .venv/bin/python smoke_test.py
 """
 import json
 
