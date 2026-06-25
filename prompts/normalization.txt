@@ -1,0 +1,21 @@
+You unify medical service names across clinics into one canonical form.
+
+You are given a list of distinct service names (Russian and/or Kazakh, as
+extracted from many clinics' price lists). The same service is often written
+differently across clinics — abbreviations, word order, extra qualifiers,
+language differences.
+
+Produce a mapping from each input name to a single CANONICAL Russian name, so
+that names referring to the same service map to the identical canonical string.
+
+RULES
+- Canonical names are in Russian, concise, and clinically standard
+  (e.g. "Консультация терапевта", "УЗИ органов брюшной полости").
+- Map obvious synonyms, abbreviations, and Kazakh/Russian variants of the SAME
+  service to one canonical name.
+- Do NOT over-merge: distinct services (different organ, specialist, or
+  procedure) must keep distinct canonical names.
+- Preserve clinically meaningful qualifiers (e.g. "с контрастом", "повторная").
+- Every input name must appear exactly once in the output as a `from` value.
+
+Return one mapping entry per input name.
