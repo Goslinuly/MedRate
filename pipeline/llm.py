@@ -1,25 +1,30 @@
-"""Claude calls: text + vision extraction and service-name canonicalization.
+"""Gemini calls: text + vision extraction and service-name canonicalization.
 
-Uses the official Anthropic SDK with structured outputs (``messages.parse``) so
-the model returns strictly-shaped JSON — the README's "strict JSON" guarantee.
-Note: current Claude models (Opus 4.8) don't accept a ``temperature`` parameter;
-determinism comes from the enforced schema, not a sampling setting.
+Uses Google's ``google-genai`` SDK with structured outputs (a Pydantic
+``response_schema`` + ``response_mime_type="application/json"``) so the model
+returns strictly-shaped JSON — the README's "strict JSON" guarantee. Gemini
+accepts ``temperature=0`` for determinism.
+
+Get a free API key at https://aistudio.google.com -> "Get API key", then set
+GEMINI_API_KEY (or GOOGLE_API_KEY).
 """
 from __future__ import annotations
 
+import base64
 import functools
 import os
 import time
 from pathlib import Path
 from typing import Optional
 
-import anthropic
+from google import genai
+from google.genai import errors, types
 from pydantic import BaseModel
 
 from .normalize import CATEGORIES, FLAGS
 
 PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
-DEFAULT_MODEL = "claude-opus-4-8"
+DEFAULT_MODEL = "gemini-2.5-flash"
 # Cap images per request so a big scanned PDF doesn't blow the request size.
 MAX_IMAGES_PER_REQUEST = 20
 
@@ -56,9 +61,10 @@ class CanonicalMap(BaseModel):
 
 # --- client / prompts ----------------------------------------------------------
 
-def get_client() -> anthropic.Anthropic:
-    """Construct a client. Reads ANTHROPIC_API_KEY from the environment."""
-    return anthropic.Anthropic()
+def get_client() -> genai.Client:
+    """Construct a Gemini client. Reads GEMINI_API_KEY / GOOGLE_API_KEY."""
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    return genai.Client(api_key=key) if key else genai.Client()
 
 
 def get_model() -> str:
@@ -80,25 +86,32 @@ def _vocab_reminder() -> str:
     )
 
 
-def _parse_with_retry(client, *, model, max_tokens, system, content, schema, retries=2):
-    """Call messages.parse with simple exponential backoff on transient errors."""
+def _generate(client, *, model, system, contents, schema, max_output_tokens, retries=2):
+    """Call generate_content with JSON schema enforcement + backoff.
+
+    Returns a parsed ``schema`` instance, or None if the model produced nothing
+    usable. Thinking is disabled so the whole output budget goes to the JSON.
+    """
+    config = types.GenerateContentConfig(
+        system_instruction=system,
+        temperature=0,
+        response_mime_type="application/json",
+        response_schema=schema,
+        max_output_tokens=max_output_tokens,
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+    )
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
-            resp = client.messages.parse(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": content}],
-                output_format=schema,
-            )
-            if resp.stop_reason == "refusal":
-                raise RuntimeError("model refused the request")
-            return resp.parsed_output
-        except (anthropic.RateLimitError, anthropic.APIStatusError, anthropic.APIConnectionError) as exc:
+            resp = client.models.generate_content(model=model, contents=contents, config=config)
+            parsed = getattr(resp, "parsed", None)
+            if parsed is None and getattr(resp, "text", None):
+                parsed = schema.model_validate_json(resp.text)
+            return parsed
+        except errors.APIError as exc:
             last_exc = exc
-            status = getattr(exc, "status_code", 500)
-            if isinstance(exc, anthropic.APIStatusError) and status < 500 and status != 429:
+            code = getattr(exc, "code", 500) or 500
+            if code != 429 and code < 500:
                 raise  # non-retryable client error
             time.sleep(min(2 ** attempt, 8))
     raise last_exc  # type: ignore[misc]
@@ -106,9 +119,9 @@ def _parse_with_retry(client, *, model, max_tokens, system, content, schema, ret
 
 # --- extraction ----------------------------------------------------------------
 
-def _build_content(chunks: list[dict]) -> list[dict]:
-    """Turn extractor chunks into Claude content blocks (text + images)."""
-    blocks: list[dict] = []
+def _build_contents(chunks: list[dict]) -> list:
+    """Turn extractor chunks into Gemini content parts (text + images)."""
+    parts: list = []
     text_parts: list[str] = []
     images = 0
 
@@ -118,27 +131,23 @@ def _build_content(chunks: list[dict]) -> list[dict]:
             text_parts.append(f"{label}\n{chunk['text']}".strip())
 
     if text_parts:
-        blocks.append({"type": "text", "text": "DOCUMENT TEXT:\n\n" + "\n\n---\n\n".join(text_parts)})
+        parts.append(types.Part.from_text(text="DOCUMENT TEXT:\n\n" + "\n\n---\n\n".join(text_parts)))
 
     for chunk in chunks:
         if chunk["kind"] == "image" and chunk.get("image_b64"):
             if images >= MAX_IMAGES_PER_REQUEST:
                 break
             page = chunk.get("page")
-            blocks.append({"type": "text", "text": f"IMAGE — page {page}:" if page is not None else "IMAGE:"})
-            blocks.append(
-                {
-                    "type": "image",
-                    "source": {
-                        "type": "base64",
-                        "media_type": chunk.get("media_type", "image/png"),
-                        "data": chunk["image_b64"],
-                    },
-                }
+            parts.append(types.Part.from_text(text=f"IMAGE — page {page}:" if page is not None else "IMAGE:"))
+            parts.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(chunk["image_b64"]),
+                    mime_type=chunk.get("media_type", "image/png"),
+                )
             )
             images += 1
 
-    return blocks
+    return parts
 
 
 def extract_records(client, chunks: list[dict], *, clinic_name: str, source_file: str,
@@ -148,15 +157,15 @@ def extract_records(client, chunks: list[dict], *, clinic_name: str, source_file
     Returns a list of plain dicts with provenance (clinic_name, clinic_id,
     source_file) attached. Returns [] if there's nothing to send.
     """
-    content = _build_content(chunks)
-    if not content:
+    contents = _build_contents(chunks)
+    if not contents:
         return []
 
     model = model or get_model()
     system = load_prompt("extraction.txt") + _vocab_reminder()
-    result: ExtractionResult = _parse_with_retry(
-        client, model=model, max_tokens=16000, system=system,
-        content=content, schema=ExtractionResult,
+    result: Optional[ExtractionResult] = _generate(
+        client, model=model, system=system, contents=contents,
+        schema=ExtractionResult, max_output_tokens=16000,
     )
     if result is None:
         return []
@@ -183,11 +192,11 @@ def canonicalize_names(client, names: list[str], *, model: Optional[str] = None)
 
     model = model or get_model()
     system = load_prompt("normalization.txt")
-    content = [{"type": "text", "text": "INPUT NAMES:\n" + "\n".join(f"- {n}" for n in names)}]
+    contents = [types.Part.from_text(text="INPUT NAMES:\n" + "\n".join(f"- {n}" for n in names))]
     try:
-        result: CanonicalMap = _parse_with_retry(
-            client, model=model, max_tokens=8000, system=system,
-            content=content, schema=CanonicalMap,
+        result: Optional[CanonicalMap] = _generate(
+            client, model=model, system=system, contents=contents,
+            schema=CanonicalMap, max_output_tokens=8000,
         )
     except Exception:
         return {n: n for n in names}

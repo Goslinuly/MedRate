@@ -109,8 +109,9 @@ st.set_page_config(page_title="MedRate", page_icon="🏥", layout="wide")
 st.title("🏥 MedRate")
 st.caption("Upload clinic price lists in any format → one clean, comparable table.")
 
-if "ANTHROPIC_API_KEY" not in os.environ or not os.environ["ANTHROPIC_API_KEY"]:
-    st.warning("Set `ANTHROPIC_API_KEY` (e.g. in a `.env` file) before processing.")
+if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+    st.warning("Set `GEMINI_API_KEY` (e.g. in a `.env` file) before processing. "
+               "Get a free key at https://aistudio.google.com.")
 
 uploaded = st.file_uploader(
     "Upload a .zip archive or individual price lists",
