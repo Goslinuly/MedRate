@@ -11,13 +11,14 @@ MedRate does it for you: **upload an archive → get a clean, unified, comparabl
 ## ✨ Features
 
 - 📥 **Any format in** — `.xlsx`, `.xls`, `.csv`, `.pdf` (text & scanned), `.docx`, `.png`, `.jpg`, `.jpeg`
-- 🧠 **LLM-powered extraction** — Claude AI models read each document the way a human would: understanding table structure, abbreviations, and messy layouts
+- 🧠 **Model-powered extraction** — Claude reads each document the way a human would: understanding table structure, abbreviations, and messy layouts
 - 👁️ **Vision for scans & photos** — low-quality scans and phone photos are read via vision, not brittle OCR rules
 - 🌐 **Bilingual** — handles mixed Russian / Kazakh text and preserves both
-- 🔗 **Service normalization** — the same service named differently across clinics maps to one canonical name
+- 🔗 **Service normalization** — the same service named differently across clinics maps to one canonical name from the reference catalogue
 - 💰 **Smart prices** — ranges and "from X" are split into `price_min` / `price_max`; numbers are cleaned, never invented
 - 🚩 **Trust signals** — every row gets a `confidence` score and `flags`; unreadable values become `null`, never a guess
-- 🔍 **Search & filter** — by service, category, clinic, or "show only problematic rows"
+- 🔍 **Search & filter** — by service, city, category, clinic, price range, "only problematic", "only active"
+- 📊 **Compare & history** — clinic-by-clinic price comparison and multi-year price history
 - 📤 **One-click export** — to `output.xlsx`
 
 ---
@@ -31,59 +32,64 @@ Archive (.zip / folder)
    ┌─────────┐   detect type & preprocess
    │ Ingest  │──────────────────────────────┐
    └─────────┘                               │
-   Excel/CSV → table text                    │
+   Excel/CSV → table text (header detection) │
    Text PDF  → page text                     ▼
    Scan PDF  → page images           ┌──────────────┐
-   DOCX      → text                  │  Claude LLM  │  extraction (text + vision)
+   DOCX      → text                  │    Claude    │  extraction (text + vision)
    Images    → base64                └──────────────┘
                                             │  strict JSON, temperature 0
                                             ▼
                                    ┌──────────────────┐
                                    │   Normalize      │  prices, currency, categories
-                                   │   Canonicalize   │  unify service names
-                                   │   Deduplicate    │  merge & flag conflicts
+                                   │   Canonicalize   │  exact → fuzzy → model tie-break
+                                   │   Deduplicate    │  merge, history, flag conflicts
                                    └──────────────────┘
                                             │
                                             ▼
                                   SQLite  →  Streamlit UI  →  Excel export
 ```
 
-The core philosophy: **let the model do the hard part** — understanding a messy document and pulling out structured data — and build thin, reliable orchestration around it (a fixed JSON schema, vision for scans, name canonicalization, and honest `confidence` / `flags`). No per-format parsers, no per-clinic rules.
+The core idea: let the model do the hard part — understanding a messy document and pulling out structured data — and build thin, reliable orchestration around it (a fixed JSON schema, vision for scans, three-tier name canonicalization, response caching, and honest `confidence` / `flags`). No per-format parsers, no per-clinic rules, no hard-coded header rows.
 
 ---
 
 ## 📦 Data schema
 
-Each price line becomes one structured record:
+Each price line becomes one structured record in the `services` table:
 
 | Field | Description |
 |---|---|
-| `clinic_name`, `clinic_id` | Clinic name and slug |
+| `clinic_id`, `clinic_name` | Clinic slug and name |
+| `city`, `address`, `phone`, `working_hours` | Clinic details when present in the file, else `null` |
 | `service_name_raw` | Exactly as written in the document |
-| `service_name_normalized` | Canonical Russian name |
+| `service_name_norm` | Canonical Russian name from the reference catalogue (`null` if unmatched) |
 | `service_name_kz` | Kazakh name, if present |
+| `ref_service_id` | Reference catalogue id, `null` if unmatched |
 | `category` | One of the fixed categories below |
 | `price`, `price_min`, `price_max` | Number(s) in KZT |
-| `currency`, `unit` | e.g. `KZT`, `per visit` |
-| `source_file`, `source_page` | Provenance |
-| `confidence` | 0.0–1.0 extraction certainty |
-| `flags`, `notes` | Quality signals & comments |
+| `currency`, `unit`, `duration_days` | e.g. `KZT`, `прием`, analysis turnaround |
+| `source_file`, `source_page`, `source_year` | Provenance |
+| `parsed_at`, `is_active` | Import time and freshness flag |
+| `confidence`, `flags`, `notes` | Quality signals & comments |
 
-**Categories:** consultation, lab tests, ultrasound, CT/MRI, x-ray/fluorography, dentistry, physiotherapy, surgery, procedures, vaccination, inpatient, other.
+**Categories:** `consultation`, `lab_tests`, `ultrasound`, `ct_mri`, `xray`, `dentistry`, `physiotherapy`, `surgery`, `procedures`, `vaccination`, `inpatient`, `other`.
 
-**Flags:** `low_quality_scan`, `ambiguous_price`, `name_uncertain`, `price_is_range`, `currency_assumed`, `multi_column_layout`, `non_price_row`.
+**Flags:** `low_quality_scan`, `ambiguous_price`, `name_uncertain`, `price_is_range`, `currency_assumed`, `multi_column_layout`, `non_price_row`, `unmatched_service`, `kzt_converted_from_usd`.
+
+Unmatched services land in a separate `unmatched_queue` for manual review; raw model output is kept in `raw_extractions`; every file processed is logged to `ingest_log`.
 
 ---
 
 ## 🛠️ Tech stack
 
-- **Python 3.11+**
-- **Claude AI models** via the Anthropic SDK — text & vision extraction
-- **pandas** + **openpyxl** — Excel / CSV
+- **Python 3.9+**
+- **Claude** via the Anthropic SDK — text & vision extraction
+- **pandas** + **openpyxl** + **xlrd** — Excel / CSV (including legacy `.xls`)
 - **pdfplumber** — PDF text layer
 - **pdf2image** (+ poppler) — render scanned pages
 - **python-docx** — Word
 - **Pillow** — image handling
+- **rapidfuzz** — fuzzy reference matching
 - **SQLite** — storage
 - **Streamlit** — web UI
 
@@ -107,11 +113,18 @@ pip install -r requirements.txt
 # 4. API key
 cp .env.example .env        # add your ANTHROPIC_API_KEY
 
-# 5. Run
+# 5. Run the app
 streamlit run app.py
 ```
 
-Then open the app, upload a `.zip` or folder of price lists, press **Process**, and explore the unified table.
+In the app: upload a `.zip` or files in the sidebar and press **Обработать загруженное**, or press **Обработать data/samples/** to process the bundled sample archive. Then search, filter, compare clinics, view price history, and export.
+
+### Headless processing
+
+```bash
+python run_pipeline.py                 # process data/samples/
+python run_pipeline.py path/to/archive.zip --reset
+```
 
 ---
 
@@ -120,31 +133,53 @@ Then open the app, upload a `.zip` or folder of price lists, press **Process**, 
 ```
 MedRate/
 ├── app.py                  # Streamlit UI
+├── run_pipeline.py         # headless pipeline runner
+├── config.py               # env, models, paths, categories, flags
+├── db.py                   # SQLite schema, upserts, cache, logging
+├── queries.py              # read queries for the UI
 ├── pipeline/
+│   ├── models.py           # RawDoc and clinic metadata
 │   ├── ingest.py           # unzip, walk folder, dispatch by file type
-│   ├── extract_excel.py    # xlsx/csv/xls → table text
+│   ├── extract_excel.py    # xlsx/xls/csv → table text + header detection
 │   ├── extract_pdf.py      # text layer vs scan detection
-│   ├── extract_docx.py     # docx → text
+│   ├── extract_docx.py     # docx paragraphs & tables → text
 │   ├── extract_image.py    # images → base64
-│   ├── llm.py              # Claude calls, retries, robust JSON parsing
-│   ├── normalize.py        # prices, currency, categories
-│   └── dedup.py            # dedup & conflict handling
+│   ├── llm.py              # Claude calls, caching, retries, JSON parsing
+│   ├── normalize.py        # prices, currency, categories, canonicalization
+│   ├── dedup.py            # dedup keys & active-version selection
+│   └── process.py          # end-to-end orchestration
 ├── prompts/
 │   ├── extraction.txt
 │   └── normalization.txt
-├── db.py                   # SQLite schema & queries
-├── data/samples/           # sample price lists (all formats)
+├── data/
+│   ├── samples/            # sample price lists (8 clinics, all formats)
+│   └── reference/services.xlsx
 ├── requirements.txt
 └── .env.example
 ```
 
 ---
 
-## ⚠️ Known limitations
+## ⚙️ Configuration
 
-- Built as a hackathon MVP — tuned for demo-scale archives (5–10 files).
-- Extraction quality on very poor scans is intentionally conservative: unreadable values are returned as `null` with a flag rather than guessed.
-- Category and canonical-name coverage grows as more documents are processed.
+`.env` keys (see `.env.example`):
+
+| Key | Default | Purpose |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | — | required |
+| `MEDRATE_EXTRACT_MODEL` | `claude-sonnet-4-6` | text extraction |
+| `MEDRATE_VISION_MODEL` | `claude-sonnet-4-6` | scanned pages & images |
+| `MEDRATE_NORMALIZE_MODEL` | `claude-opus-4-8` | canonicalization tie-break |
+| `USD_KZT_RATE` | `470` | USD → KZT conversion |
+
+---
+
+## ⚠️ Notes & limitations
+
+- MVP scope: it consumes the supplied archive of clinic price lists; it does not crawl clinic websites. No patient or personal data is collected.
+- Extraction is conservative by design: unreadable prices or names become `null` with a flag rather than a guess.
+- Model responses are cached in SQLite, so re-processing the same archive is fast and cheap, and re-runs are idempotent (no duplicate rows).
+- Canonical-name coverage grows as more documents are processed.
 
 ---
 
