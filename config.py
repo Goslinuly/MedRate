@@ -13,13 +13,13 @@ PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "medrate.db"
 EXPORT_PATH = BASE_DIR / "output.xlsx"
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-EXTRACT_MODEL = os.getenv("MEDRATE_EXTRACT_MODEL", "claude-sonnet-4-6")
-VISION_MODEL = os.getenv("MEDRATE_VISION_MODEL", "claude-sonnet-4-6")
-NORMALIZE_MODEL = os.getenv("MEDRATE_NORMALIZE_MODEL", "claude-opus-4-8")
-CATEGORY_MODEL = os.getenv("MEDRATE_CATEGORY_MODEL", "claude-haiku-4-5-20251001")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+EXTRACT_MODEL = os.getenv("MEDRATE_EXTRACT_MODEL", "gemini-2.5-flash")
+VISION_MODEL = os.getenv("MEDRATE_VISION_MODEL", "gemini-2.5-flash")
+NORMALIZE_MODEL = os.getenv("MEDRATE_NORMALIZE_MODEL", "gemini-2.5-flash")
 
 USD_KZT_RATE = float(os.getenv("USD_KZT_RATE", "470"))
+LLM_TIEBREAK = os.getenv("MEDRATE_LLM_TIEBREAK", "1") == "1"
 
 ACTIVE_MAX_AGE_DAYS = 30
 RAW_RETENTION_DAYS = 90
