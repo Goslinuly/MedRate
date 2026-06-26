@@ -1,0 +1,13 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+output.xlsx
+.DS_Store
+.streamlit/secrets.toml
