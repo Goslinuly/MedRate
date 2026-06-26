@@ -5,7 +5,7 @@ from typing import Optional
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-from config import CATEGORIES, REFERENCE_FILE, USD_KZT_RATE
+from config import CATEGORIES, LLM_TIEBREAK, REFERENCE_FILE, USD_KZT_RATE
 from pipeline import llm
 
 EXACT_CONFIDENCE = 0.97
@@ -170,14 +170,21 @@ def canonicalize(service_name_raw: str, ref_index: ReferenceIndex, conn=None) ->
         for entry, score in shortlist
         if score >= FUZZY_SHORTLIST_SCORE
     ]
-    if candidates:
-        decision = llm.match_service(service_name_raw, candidates, conn=conn)
+    if candidates and LLM_TIEBREAK:
+        decision = _safe_match(service_name_raw, candidates, conn)
         ref_id = decision.get("ref_service_id")
         if isinstance(ref_id, int) and ref_id in {c["id"] for c in candidates}:
             entry = ref_index.get(ref_id)
             confidence = float(decision.get("confidence") or 0.6)
             return _matched(entry, confidence)
     return _unmatched(candidates)
+
+
+def _safe_match(service_name_raw: str, candidates: list[dict], conn) -> dict:
+    try:
+        return llm.match_service(service_name_raw, candidates, conn=conn)
+    except Exception:
+        return {}
 
 
 def _matched(entry: dict, confidence: float) -> dict:

@@ -22,7 +22,9 @@ def process_samples(conn, progress: Optional[ProgressCallback] = None) -> dict:
     return process_paths([SAMPLES_DIR], conn, progress)
 
 
-def process_paths(paths, conn, progress: Optional[ProgressCallback] = None) -> dict:
+def process_paths(
+    paths, conn, progress: Optional[ProgressCallback] = None, max_chunks: Optional[int] = None
+) -> dict:
     ref_index = build_ref_index()
     files = _collect_files(paths)
     stats = {"files": 0, "failed_files": 0, "services": 0, "unmatched": 0}
@@ -32,7 +34,7 @@ def process_paths(paths, conn, progress: Optional[ProgressCallback] = None) -> d
         if progress:
             progress(file_path.name, index, len(files))
         try:
-            _process_file(conn, file_path, ref_index, queued)
+            _process_file(conn, file_path, ref_index, queued, max_chunks)
             stats["files"] += 1
         except Exception as error:
             stats["failed_files"] += 1
@@ -56,7 +58,7 @@ def _collect_files(paths) -> list[Path]:
     return files
 
 
-def _process_file(conn, file_path: Path, ref_index, queued: set) -> None:
+def _process_file(conn, file_path: Path, ref_index, queued: set, max_chunks: Optional[int] = None) -> None:
     meta = clinic_meta_from_filename(file_path)
     upsert_clinic(conn, {"clinic_id": meta["clinic_id"], "clinic_name": meta["clinic_name"]})
 
@@ -64,6 +66,8 @@ def _process_file(conn, file_path: Path, ref_index, queued: set) -> None:
     if not docs:
         log_ingest(conn, file_path.name, "extract", "empty", "no content extracted")
         return
+    if max_chunks is not None:
+        docs = docs[:max_chunks]
 
     from pipeline import llm
 
