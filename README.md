@@ -11,7 +11,7 @@ MedRate does it for you: **upload an archive → get a clean, unified, comparabl
 ## ✨ Features
 
 - 📥 **Any format in** — `.xlsx`, `.xls`, `.csv`, `.pdf` (text & scanned), `.docx`, `.png`, `.jpg`, `.jpeg`
-- 🧠 **Model-powered extraction** — Claude reads each document the way a human would: understanding table structure, abbreviations, and messy layouts
+- 🧠 **Model-powered extraction** — Google Gemini reads each document the way a human would: understanding table structure, abbreviations, and messy layouts
 - 👁️ **Vision for scans & photos** — low-quality scans and phone photos are read via vision, not brittle OCR rules
 - 🌐 **Bilingual** — handles mixed Russian / Kazakh text and preserves both
 - 🔗 **Service normalization** — the same service named differently across clinics maps to one canonical name from the reference catalogue
@@ -35,7 +35,7 @@ Archive (.zip / folder)
    Excel/CSV → table text (header detection) │
    Text PDF  → page text                     ▼
    Scan PDF  → page images           ┌──────────────┐
-   DOCX      → text                  │    Claude    │  extraction (text + vision)
+   DOCX      → text                  │    Gemini    │  extraction (text + vision)
    Images    → base64                └──────────────┘
                                             │  strict JSON, temperature 0
                                             ▼
@@ -83,7 +83,7 @@ Unmatched services land in a separate `unmatched_queue` for manual review; raw m
 ## 🛠️ Tech stack
 
 - **Python 3.9+**
-- **Claude** via the Anthropic SDK — text & vision extraction
+- **Google Gemini** via the `google-genai` SDK — text & vision extraction
 - **pandas** + **openpyxl** + **xlrd** — Excel / CSV (including legacy `.xls`)
 - **pdfplumber** — PDF text layer
 - **pdf2image** (+ poppler) — render scanned pages
@@ -111,7 +111,7 @@ pip install -r requirements.txt
 #    Linux:  apt-get install poppler-utils
 
 # 4. API key
-cp .env.example .env        # add your ANTHROPIC_API_KEY
+cp .env.example .env        # add your GOOGLE_API_KEY
 
 # 5. Run the app
 streamlit run app.py
@@ -144,7 +144,7 @@ MedRate/
 │   ├── extract_pdf.py      # text layer vs scan detection
 │   ├── extract_docx.py     # docx paragraphs & tables → text
 │   ├── extract_image.py    # images → base64
-│   ├── llm.py              # Claude calls, caching, retries, JSON parsing
+│   ├── llm.py              # Gemini calls, caching, retries, JSON parsing
 │   ├── normalize.py        # prices, currency, categories, canonicalization
 │   ├── dedup.py            # dedup keys & active-version selection
 │   └── process.py          # end-to-end orchestration
@@ -166,10 +166,11 @@ MedRate/
 
 | Key | Default | Purpose |
 |---|---|---|
-| `ANTHROPIC_API_KEY` | — | required |
-| `MEDRATE_EXTRACT_MODEL` | `claude-sonnet-4-6` | text extraction |
-| `MEDRATE_VISION_MODEL` | `claude-sonnet-4-6` | scanned pages & images |
-| `MEDRATE_NORMALIZE_MODEL` | `claude-opus-4-8` | canonicalization tie-break |
+| `GOOGLE_API_KEY` | — | required |
+| `MEDRATE_EXTRACT_MODEL` | `gemini-2.5-flash` | text extraction |
+| `MEDRATE_VISION_MODEL` | `gemini-2.5-flash` | scanned pages & images |
+| `MEDRATE_NORMALIZE_MODEL` | `gemini-2.5-flash` | canonicalization tie-break |
+| `MEDRATE_LLM_TIEBREAK` | `1` | enable the model tie-break (`0` to use exact+fuzzy only) |
 | `USD_KZT_RATE` | `470` | USD → KZT conversion |
 
 ---
