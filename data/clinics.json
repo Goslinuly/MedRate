@@ -1,0 +1,108 @@
+{
+  "clinics": [
+    {
+      "clinic_id": "clinic_1",
+      "clinic_name": "Клиника 1",
+      "city": "Алматы",
+      "address": "ул. Абая, 52",
+      "phone": "+7 727 310 10 01",
+      "working_hours": "Пн-Пт 08:00-20:00, Сб 09:00-15:00",
+      "source_url": "https://example.com/clinic-1/price",
+      "lat": 43.238949,
+      "lon": 76.889709,
+      "rating": 4.7,
+      "online_booking": true
+    },
+    {
+      "clinic_id": "clinic_2",
+      "clinic_name": "Клиника 2",
+      "city": "Алматы",
+      "address": "пр. Назарбаева, 120",
+      "phone": "+7 727 310 10 02",
+      "working_hours": "Ежедневно 08:00-22:00",
+      "source_url": "https://example.com/clinic-2/price",
+      "lat": 43.255058,
+      "lon": 76.945465,
+      "rating": 4.5,
+      "online_booking": true
+    },
+    {
+      "clinic_id": "clinic_3",
+      "clinic_name": "Клиника 3",
+      "city": "Астана",
+      "address": "пр. Кабанбай Батыра, 46",
+      "phone": "+7 7172 50 10 03",
+      "working_hours": "Пн-Сб 08:00-20:00",
+      "source_url": "https://example.com/clinic-3/price",
+      "lat": 51.128207,
+      "lon": 71.430411,
+      "rating": 4.6,
+      "online_booking": false
+    },
+    {
+      "clinic_id": "clinic_4",
+      "clinic_name": "Клиника 4",
+      "city": "Астана",
+      "address": "ул. Достык, 12",
+      "phone": "+7 7172 50 10 04",
+      "working_hours": "Пн-Пт 09:00-19:00",
+      "source_url": "https://example.com/clinic-4/price",
+      "lat": 51.090692,
+      "lon": 71.417357,
+      "rating": 4.3,
+      "online_booking": true
+    },
+    {
+      "clinic_id": "clinic_5",
+      "clinic_name": "Клиника 5",
+      "city": "Шымкент",
+      "address": "ул. Байтурсынова, 18",
+      "phone": "+7 7252 40 10 05",
+      "working_hours": "Пн-Пт 08:30-19:00, Сб 09:00-14:00",
+      "source_url": "https://example.com/clinic-5/price",
+      "lat": 42.341684,
+      "lon": 69.590101,
+      "rating": 4.4,
+      "online_booking": false
+    },
+    {
+      "clinic_id": "clinic_6",
+      "clinic_name": "Клиника 6",
+      "city": "Караганда",
+      "address": "пр. Бухар Жырау, 55",
+      "phone": "+7 7212 30 10 06",
+      "working_hours": "Ежедневно 08:00-20:00",
+      "source_url": "https://example.com/clinic-6/price",
+      "lat": 49.806103,
+      "lon": 73.085427,
+      "rating": 4.2,
+      "online_booking": true
+    },
+    {
+      "clinic_id": "clinic_7",
+      "clinic_name": "Клиника 7",
+      "city": "Алматы",
+      "address": "ул. Сатпаева, 90",
+      "phone": "+7 727 310 10 07",
+      "working_hours": "Пн-Сб 08:00-21:00",
+      "source_url": "https://example.com/clinic-7/price",
+      "lat": 43.227521,
+      "lon": 76.921584,
+      "rating": 4.8,
+      "online_booking": true
+    },
+    {
+      "clinic_id": "clinic_8",
+      "clinic_name": "Клиника 8",
+      "city": "Актобе",
+      "address": "пр. Абилкайыр Хана, 34",
+      "phone": "+7 7132 20 10 08",
+      "working_hours": "Пн-Пт 09:00-18:00",
+      "source_url": "https://example.com/clinic-8/price",
+      "lat": 50.283933,
+      "lon": 57.166978,
+      "rating": 4.1,
+      "online_booking": false
+    }
+  ]
+}

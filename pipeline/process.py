@@ -10,6 +10,7 @@ from db import (
     upsert_clinic,
     upsert_service,
 )
+from pipeline.clinic_metadata import clinic_metadata
 from pipeline.dedup import finalize_active, make_dedup_key
 from pipeline.ingest import ingest, unzip_or_walk
 from pipeline.models import RawDoc, clinic_meta_from_filename
@@ -60,7 +61,8 @@ def _collect_files(paths) -> list[Path]:
 
 def _process_file(conn, file_path: Path, ref_index, queued: set, max_chunks: Optional[int] = None) -> None:
     meta = clinic_meta_from_filename(file_path)
-    upsert_clinic(conn, {"clinic_id": meta["clinic_id"], "clinic_name": meta["clinic_name"]})
+    meta.update(clinic_metadata(meta["clinic_id"]))
+    upsert_clinic(conn, meta)
 
     docs = ingest(file_path)
     if not docs:
@@ -101,13 +103,18 @@ def _store_row(conn, doc: RawDoc, row: dict, ref_index, seen_prices: dict, queue
             flags = sorted(set(flags + ["ambiguous_price"]))
         seen_prices[dedup_key] = main_price
 
+    meta = clinic_metadata(doc.clinic_id)
     record = {
         "clinic_id": doc.clinic_id,
-        "clinic_name": doc.clinic_name,
-        "city": None,
-        "address": None,
-        "phone": None,
-        "working_hours": None,
+        "clinic_name": meta.get("clinic_name") or doc.clinic_name,
+        "city": meta.get("city"),
+        "address": meta.get("address"),
+        "phone": meta.get("phone"),
+        "working_hours": meta.get("working_hours"),
+        "lat": meta.get("lat"),
+        "lon": meta.get("lon"),
+        "rating": meta.get("rating"),
+        "online_booking": int(bool(meta.get("online_booking"))),
         "service_name_raw": name_raw,
         "service_name_norm": canon["service_name_norm"],
         "service_name_kz": row.get("service_name_kz"),
@@ -122,7 +129,7 @@ def _store_row(conn, doc: RawDoc, row: dict, ref_index, seen_prices: dict, queue
         "source_file": doc.source_file,
         "source_page": doc.source_page,
         "source_year": doc.source_year,
-        "source_url": None,
+        "source_url": meta.get("source_url"),
         "parsed_at": now_iso(),
         "is_active": 1,
         "confidence": _combine_confidence(row.get("confidence"), canon),

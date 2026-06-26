@@ -1,7 +1,10 @@
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = lambda: None
 
 load_dotenv()
 
@@ -9,6 +12,7 @@ BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 SAMPLES_DIR = DATA_DIR / "samples"
 REFERENCE_FILE = DATA_DIR / "reference" / "services.xlsx"
+CLINICS_FILE = DATA_DIR / "clinics.json"
 PROMPTS_DIR = BASE_DIR / "prompts"
 DB_PATH = BASE_DIR / "medrate.db"
 EXPORT_PATH = BASE_DIR / "output.xlsx"
