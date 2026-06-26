@@ -55,7 +55,8 @@ CREATE TABLE IF NOT EXISTS unmatched_queue (
     source_file      TEXT,
     source_page      INTEGER,
     candidates       TEXT,
-    created_at       TEXT
+    created_at       TEXT,
+    UNIQUE(clinic_id, service_name_raw)
 );
 
 CREATE TABLE IF NOT EXISTS ingest_log (
@@ -157,7 +158,8 @@ def upsert_service(conn: sqlite3.Connection, row: dict[str, Any]) -> None:
 def add_unmatched(conn: sqlite3.Connection, row: dict[str, Any], candidates: list[dict]) -> None:
     conn.execute(
         """
-        INSERT INTO unmatched_queue (service_name_raw, clinic_id, source_file, source_page, candidates, created_at)
+        INSERT OR IGNORE INTO unmatched_queue
+            (service_name_raw, clinic_id, source_file, source_page, candidates, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
         """,
         (
