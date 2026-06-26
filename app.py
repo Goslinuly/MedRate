@@ -1,4 +1,5 @@
 import json
+import math
 import tempfile
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import streamlit as st
 import db
 import queries
 from config import EXPORT_PATH
+from pipeline.doq import import_doq_doctors
 from pipeline.process import process_paths, process_samples
 
 st.set_page_config(page_title="MedRate", page_icon="🩺", layout="wide")
@@ -48,16 +50,40 @@ def parse_flags(value) -> list[str]:
 def results_table(df: pd.DataFrame) -> pd.DataFrame:
     table = pd.DataFrame()
     table["Клиника"] = df["clinic_name"]
+    table["Город"] = df.get("city", pd.Series(dtype=object)).fillna("")
+    table["Адрес"] = df.get("address", pd.Series(dtype=object)).fillna("")
+    table["Телефон"] = df.get("phone", pd.Series(dtype=object)).fillna("")
+    table["Часы"] = df.get("working_hours", pd.Series(dtype=object)).fillna("")
+    if "doctor_name" in df:
+        table["Врач"] = df["doctor_name"].fillna("")
     table["Услуга"] = df["service_name_norm"].fillna(df["service_name_raw"])
     table["Цена, ₸"] = df.apply(format_price, axis=1)
     table["Ед."] = df["unit"].fillna("")
     table["Категория"] = df["category"].fillna("")
+    table["Рейтинг"] = df.get("rating", pd.Series(dtype=object)).fillna("")
+    if "reviews_count" in df:
+        table["Отзывы"] = df["reviews_count"].fillna("")
+    table["Онлайн"] = df.get("online_booking", pd.Series(dtype=object)).apply(
+        lambda value: "Да" if bool(value) else "Нет"
+    )
+    if "distance_km" in df:
+        table["Расст., км"] = df["distance_km"].round(1)
     table["Обновлено"] = pd.to_datetime(df["parsed_at"], errors="coerce").dt.strftime("%Y-%m-%d")
     table["Год"] = df["source_year"]
     table["Увер."] = df["confidence"]
     table["Флаги"] = df["flags"].apply(lambda v: ", ".join(parse_flags(v)))
-    table["Источник"] = df["source_file"]
+    table["Файл"] = df["source_file"]
+    table["Ссылка"] = df.get("source_url", pd.Series(dtype=object)).fillna("")
     return table
+
+
+def show_dataframe(table: pd.DataFrame) -> None:
+    st.dataframe(
+        table,
+        use_container_width=True,
+        hide_index=True,
+        column_config={"Ссылка": st.column_config.LinkColumn("Ссылка", display_text="Открыть")},
+    )
 
 
 def sidebar_processing(conn):
@@ -72,6 +98,8 @@ def sidebar_processing(conn):
         run_processing(conn, save_uploads(uploaded))
     if col2.button("Обработать data/samples/", use_container_width=True):
         run_processing(conn, None)
+    if st.sidebar.button("Импорт DOQ: акушер-гинеколог", use_container_width=True):
+        run_doq_import(conn)
 
 
 def save_uploads(uploaded) -> list[Path]:
@@ -99,6 +127,19 @@ def run_processing(conn, paths):
     status.empty()
     st.cache_data.clear()
     st.session_state["last_stats"] = stats
+
+
+def run_doq_import(conn):
+    db.clear_pipeline_tables(conn)
+    with st.spinner("Импорт DOQ API…"):
+        stats = import_doq_doctors(conn, city=3, service=73, limit=100)
+    st.cache_data.clear()
+    st.session_state["last_stats"] = {
+        "files": stats["pages"],
+        "services": stats["services"],
+        "normalized": stats["services"],
+        "failed_files": 0,
+    }
 
 
 def show_stats(conn):
@@ -138,6 +179,13 @@ def search_tab(conn):
     sort = f5.selectbox("Сортировка", list(queries.SORT_OPTIONS.keys()))
     only_active = f6.checkbox("Только актуальные", value=True)
     only_flagged = f6.checkbox("Только проблемные", value=False)
+    f7, f8, f9 = st.columns(3)
+    min_rating = f7.slider("Рейтинг от", 0.0, 5.0, 0.0, 0.1)
+    online_booking = f8.checkbox("Онлайн-запись")
+    user_lat, user_lon = None, None
+    if sort == "Расстояние ↑":
+        user_lat = f9.number_input("Широта", value=43.238949, format="%.6f")
+        user_lon = f9.number_input("Долгота", value=76.889709, format="%.6f")
 
     df = queries.search_services(
         conn,
@@ -149,10 +197,39 @@ def search_tab(conn):
         price_max=price_range[1] if price_range else None,
         only_active=only_active,
         only_flagged=only_flagged,
+        min_rating=min_rating if min_rating > 0 else None,
+        online_booking=online_booking,
         sort=sort,
     )
+    if sort == "Расстояние ↑":
+        df = add_distance(df, user_lat, user_lon).sort_values(
+            ["distance_km", "price_sort"], na_position="last"
+        )
     st.caption(f"Найдено: {len(df)}")
-    st.dataframe(results_table(df), use_container_width=True, hide_index=True)
+    show_dataframe(results_table(df))
+
+
+def add_distance(df: pd.DataFrame, user_lat: float, user_lon: float) -> pd.DataFrame:
+    df = df.copy()
+    df["distance_km"] = df.apply(
+        lambda row: distance_km(user_lat, user_lon, row.get("lat"), row.get("lon")),
+        axis=1,
+    )
+    return df
+
+
+def distance_km(lat1, lon1, lat2, lon2):
+    if pd.isna(lat2) or pd.isna(lon2):
+        return None
+    radius = 6371
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(delta_phi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2) ** 2
+    )
+    return radius * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
 def compare_tab(conn):
@@ -169,7 +246,12 @@ def compare_tab(conn):
     table["Цена, ₸"] = df.apply(format_price, axis=1)
     table["Ед."] = df["unit"].fillna("")
     table["Год"] = df["source_year"]
-    table["Источник"] = df["source_file"]
+    table["Рейтинг"] = df.get("rating", pd.Series(dtype=object)).fillna("")
+    table["Онлайн"] = df.get("online_booking", pd.Series(dtype=object)).apply(
+        lambda value: "Да" if bool(value) else "Нет"
+    )
+    table["Файл"] = df["source_file"]
+    table["Ссылка"] = df.get("source_url", pd.Series(dtype=object)).fillna("")
     cheapest = df["price_sort"].min()
     st.metric("Минимальная цена", f"{int(cheapest):,}".replace(",", " ") if pd.notna(cheapest) else "—")
     st.dataframe(
@@ -179,6 +261,7 @@ def compare_tab(conn):
         ),
         use_container_width=True,
         hide_index=True,
+        column_config={"Ссылка": st.column_config.LinkColumn("Ссылка", display_text="Открыть")},
     )
 
 
@@ -193,9 +276,14 @@ def clinic_tab(conn):
     meta = [info.get("city"), info.get("address"), info.get("phone"), info.get("working_hours")]
     shown = " · ".join(value for value in meta if value)
     st.caption(shown or "Контактные данные не указаны в прайсе")
+    cols = st.columns(3)
+    cols[0].metric("Рейтинг", info.get("rating") or "—")
+    cols[1].metric("Онлайн-запись", "Да" if info.get("online_booking") else "Нет")
+    if info.get("source_url"):
+        cols[2].link_button("Источник", info["source_url"], use_container_width=True)
     df = queries.clinic_services(conn, clinic_id)
     st.caption(f"Услуг: {len(df)}")
-    st.dataframe(results_table_for_clinic(df), use_container_width=True, hide_index=True)
+    show_dataframe(results_table_for_clinic(df))
 
 
 def results_table_for_clinic(df: pd.DataFrame) -> pd.DataFrame:
@@ -205,7 +293,8 @@ def results_table_for_clinic(df: pd.DataFrame) -> pd.DataFrame:
     table["Ед."] = df["unit"].fillna("")
     table["Категория"] = df["category"].fillna("")
     table["Флаги"] = df["flags"].apply(lambda v: ", ".join(parse_flags(v)))
-    table["Источник"] = df["source_file"]
+    table["Файл"] = df["source_file"]
+    table["Ссылка"] = df.get("source_url", pd.Series(dtype=object)).fillna("")
     return table
 
 

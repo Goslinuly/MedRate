@@ -13,7 +13,12 @@ CREATE TABLE IF NOT EXISTS clinics (
     city          TEXT,
     address       TEXT,
     phone         TEXT,
-    working_hours TEXT
+    working_hours TEXT,
+    source_url    TEXT,
+    lat           REAL,
+    lon           REAL,
+    rating        REAL,
+    online_booking INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS services (
@@ -24,6 +29,13 @@ CREATE TABLE IF NOT EXISTS services (
     address           TEXT,
     phone             TEXT,
     working_hours     TEXT,
+    lat               REAL,
+    lon               REAL,
+    rating            REAL,
+    online_booking    INTEGER DEFAULT 0,
+    doctor_name       TEXT,
+    reviews_count     INTEGER,
+    experience_years  INTEGER,
     service_name_raw  TEXT,
     service_name_norm TEXT,
     service_name_kz   TEXT,
@@ -103,20 +115,68 @@ def connect(path: Path = DB_PATH, check_same_thread: bool = True) -> sqlite3.Con
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    ensure_columns(conn)
     conn.commit()
+
+
+def ensure_columns(conn: sqlite3.Connection) -> None:
+    ensure_table_columns(
+        conn,
+        "clinics",
+        {
+            "source_url": "TEXT",
+            "lat": "REAL",
+            "lon": "REAL",
+            "rating": "REAL",
+            "online_booking": "INTEGER DEFAULT 0",
+            "doctor_name": "TEXT",
+            "reviews_count": "INTEGER",
+            "experience_years": "INTEGER",
+        },
+    )
+    ensure_table_columns(
+        conn,
+        "services",
+        {
+            "lat": "REAL",
+            "lon": "REAL",
+            "rating": "REAL",
+            "online_booking": "INTEGER DEFAULT 0",
+        },
+    )
+
+
+def ensure_table_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {
+        row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()
+    }
+    for name, definition in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
 
 def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
     conn.execute(
         """
-        INSERT INTO clinics (clinic_id, clinic_name, city, address, phone, working_hours)
-        VALUES (:clinic_id, :clinic_name, :city, :address, :phone, :working_hours)
+        INSERT INTO clinics (
+            clinic_id, clinic_name, city, address, phone, working_hours,
+            source_url, lat, lon, rating, online_booking
+        )
+        VALUES (
+            :clinic_id, :clinic_name, :city, :address, :phone, :working_hours,
+            :source_url, :lat, :lon, :rating, :online_booking
+        )
         ON CONFLICT(clinic_id) DO UPDATE SET
             clinic_name=COALESCE(excluded.clinic_name, clinic_name),
             city=COALESCE(excluded.city, city),
             address=COALESCE(excluded.address, address),
             phone=COALESCE(excluded.phone, phone),
-            working_hours=COALESCE(excluded.working_hours, working_hours)
+            working_hours=COALESCE(excluded.working_hours, working_hours),
+            source_url=COALESCE(excluded.source_url, source_url),
+            lat=COALESCE(excluded.lat, lat),
+            lon=COALESCE(excluded.lon, lon),
+            rating=COALESCE(excluded.rating, rating),
+            online_booking=COALESCE(excluded.online_booking, online_booking)
         """,
         {
             "clinic_id": clinic.get("clinic_id"),
@@ -125,12 +185,19 @@ def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
             "address": clinic.get("address"),
             "phone": clinic.get("phone"),
             "working_hours": clinic.get("working_hours"),
+            "source_url": clinic.get("source_url"),
+            "lat": clinic.get("lat"),
+            "lon": clinic.get("lon"),
+            "rating": clinic.get("rating"),
+            "online_booking": int(bool(clinic.get("online_booking"))),
         },
     )
 
 
 SERVICE_COLUMNS = [
     "clinic_id", "clinic_name", "city", "address", "phone", "working_hours",
+    "lat", "lon", "rating", "online_booking", "doctor_name", "reviews_count",
+    "experience_years",
     "service_name_raw", "service_name_norm", "service_name_kz", "ref_service_id",
     "category", "price", "price_min", "price_max", "currency", "unit",
     "duration_days", "source_file", "source_page", "source_year", "source_url",

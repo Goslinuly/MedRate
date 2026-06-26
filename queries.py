@@ -10,6 +10,8 @@ SORT_OPTIONS = {
     "Цена ↓": "price_sort DESC",
     "Сначала свежие": "parsed_at DESC",
     "По названию": "service_name_norm ASC",
+    "Рейтинг ↓": "rating DESC",
+    "Расстояние ↑": "price_sort ASC",
 }
 
 PRICE_SORT = "COALESCE(price, price_min, price_max)"
@@ -56,6 +58,8 @@ def search_services(
     price_max: Optional[float] = None,
     only_active: bool = True,
     only_flagged: bool = False,
+    min_rating: Optional[float] = None,
+    online_booking: bool = False,
     sort: str = "Цена ↑",
     limit: int = 1000,
 ) -> pd.DataFrame:
@@ -86,6 +90,11 @@ def search_services(
         clauses.append("is_active = 1")
     if only_flagged:
         clauses.append("flags IS NOT NULL AND flags != '[]'")
+    if min_rating is not None:
+        clauses.append("rating >= ?")
+        params.append(min_rating)
+    if online_booking:
+        clauses.append("online_booking = 1")
 
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
     order = SORT_OPTIONS.get(sort, "price_sort ASC")
@@ -93,7 +102,9 @@ def search_services(
         SELECT clinic_name, service_name_norm, service_name_raw, service_name_kz, category,
                price, price_min, price_max, currency, unit, {PRICE_SORT} AS price_sort,
                parsed_at, source_year, confidence, flags, source_file, source_page,
-               clinic_id, ref_service_id, is_active
+               source_url, clinic_id, ref_service_id, is_active, city, address, phone,
+               working_hours, lat, lon, rating, online_booking, doctor_name,
+               reviews_count, experience_years
         FROM services
         {where}
         ORDER BY {order}
@@ -114,7 +125,9 @@ def clinic_services(conn: sqlite3.Connection, clinic_id: str) -> pd.DataFrame:
         f"""
         SELECT service_name_norm, service_name_raw, category, price, price_min, price_max,
                currency, unit, {PRICE_SORT} AS price_sort, parsed_at, source_year, confidence,
-               flags, source_file
+               flags, source_file, source_url, city, address, phone, working_hours,
+               lat, lon, rating, online_booking, doctor_name, reviews_count,
+               experience_years
         FROM services WHERE clinic_id = ? AND is_active = 1
         ORDER BY category, service_name_norm
         """,
@@ -127,7 +140,9 @@ def compare_service(conn: sqlite3.Connection, service_name_norm: str) -> pd.Data
     return pd.read_sql_query(
         f"""
         SELECT clinic_name, service_name_raw, price, price_min, price_max, currency, unit,
-               {PRICE_SORT} AS price_sort, parsed_at, source_year, confidence, flags, source_file
+               {PRICE_SORT} AS price_sort, parsed_at, source_year, confidence, flags,
+               source_file, source_url, city, lat, lon, rating, online_booking
+               , doctor_name, reviews_count, experience_years
         FROM services
         WHERE service_name_norm = ? AND is_active = 1
         ORDER BY price_sort ASC

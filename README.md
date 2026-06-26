@@ -124,6 +124,7 @@ In the app: upload a `.zip` or files in the sidebar and press **Обработа
 ```bash
 python run_pipeline.py                 # process data/samples/
 python run_pipeline.py path/to/archive.zip --reset
+python run_pipeline.py --reset --doq   # import Алматы акушер-гинеколог offers from DOQ API
 ```
 
 ---
