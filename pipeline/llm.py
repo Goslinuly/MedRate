@@ -37,8 +37,9 @@ def _call(model: str, system: str, contents: list, max_tokens: int) -> str:
         temperature=0,
         max_output_tokens=max_tokens,
         response_mime_type="application/json",
-        thinking_config=types.ThinkingConfig(thinking_budget=0),
     )
+    if model.startswith("gemini-2.5"):
+        config.thinking_config = types.ThinkingConfig(thinking_budget=0)
     last_error: Optional[Exception] = None
     for attempt in range(MAX_RETRIES):
         try:
