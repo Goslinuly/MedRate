@@ -1,0 +1,11 @@
+anthropic
+streamlit
+pandas
+openpyxl
+xlrd
+pdfplumber
+pdf2image
+python-docx
+Pillow
+rapidfuzz
+python-dotenv
