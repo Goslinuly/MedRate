@@ -92,9 +92,10 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def connect(path: Path = DB_PATH) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path))
+def connect(path: Path = DB_PATH, check_same_thread: bool = True) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
     conn.row_factory = sqlite3.Row
+    conn.create_function("ulower", 1, lambda value: value.lower() if value else value)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
