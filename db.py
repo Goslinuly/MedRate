@@ -32,7 +32,11 @@ CREATE TABLE IF NOT EXISTS services (
     price             REAL,
     price_min         REAL,
     price_max         REAL,
+    price_resident    REAL,
+    price_nonresident REAL,
+    price_original    REAL,
     currency          TEXT,
+    currency_original TEXT,
     unit              TEXT,
     duration_days     INTEGER,
     source_file       TEXT,
@@ -41,6 +45,8 @@ CREATE TABLE IF NOT EXISTS services (
     source_url        TEXT,
     parsed_at         TEXT,
     is_active         INTEGER DEFAULT 1,
+    is_verified       INTEGER DEFAULT 0,
+    verification_note TEXT,
     confidence        REAL,
     flags             TEXT,
     notes             TEXT,
@@ -101,9 +107,27 @@ def connect(path: Path = DB_PATH, check_same_thread: bool = True) -> sqlite3.Con
     return conn
 
 
+ADDED_SERVICE_COLUMNS = {
+    "price_resident": "REAL",
+    "price_nonresident": "REAL",
+    "price_original": "REAL",
+    "currency_original": "TEXT",
+    "is_verified": "INTEGER DEFAULT 0",
+    "verification_note": "TEXT",
+}
+
+
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    existing = {row["name"] for row in conn.execute("PRAGMA table_info(services)")}
+    for column, decl in ADDED_SERVICE_COLUMNS.items():
+        if column not in existing:
+            conn.execute(f"ALTER TABLE services ADD COLUMN {column} {decl}")
 
 
 def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
@@ -132,9 +156,11 @@ def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
 SERVICE_COLUMNS = [
     "clinic_id", "clinic_name", "city", "address", "phone", "working_hours",
     "service_name_raw", "service_name_norm", "service_name_kz", "ref_service_id",
-    "category", "price", "price_min", "price_max", "currency", "unit",
+    "category", "price", "price_min", "price_max", "price_resident", "price_nonresident",
+    "price_original", "currency", "currency_original", "unit",
     "duration_days", "source_file", "source_page", "source_year", "source_url",
-    "parsed_at", "is_active", "confidence", "flags", "notes", "dedup_key",
+    "parsed_at", "is_active", "is_verified", "verification_note",
+    "confidence", "flags", "notes", "dedup_key",
 ]
 
 

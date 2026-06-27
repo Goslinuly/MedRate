@@ -14,6 +14,7 @@ from pipeline.dedup import finalize_active, make_dedup_key
 from pipeline.ingest import ingest, unzip_or_walk
 from pipeline.models import RawDoc, clinic_meta_from_filename
 from pipeline.normalize import build_ref_index, canonicalize, map_category, parse_price
+from pipeline.validate import finalize_anomalies, validate_record, verification_status
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -42,6 +43,7 @@ def process_paths(
             conn.commit()
 
     finalize_active(conn)
+    finalize_anomalies(conn)
     conn.commit()
     stats["services"] = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
     stats["unmatched"] = conn.execute("SELECT COUNT(*) FROM unmatched_queue").fetchone()[0]
@@ -88,6 +90,7 @@ def _store_row(conn, doc: RawDoc, row: dict, ref_index, seen_prices: dict, queue
         return False
 
     price_info = parse_price(row.get("price_raw"), row.get("currency_raw"))
+    nonresident_info = parse_price(row.get("price_nonresident_raw"), row.get("currency_raw"))
     canon = canonicalize(name_raw, ref_index, conn=conn)
     flags = sorted(set(flags + price_info["flags"] + canon["flags"]))
 
@@ -101,6 +104,7 @@ def _store_row(conn, doc: RawDoc, row: dict, ref_index, seen_prices: dict, queue
             flags = sorted(set(flags + ["ambiguous_price"]))
         seen_prices[dedup_key] = main_price
 
+    nonresident_price = nonresident_info["price"] if nonresident_info["price"] is not None else nonresident_info["price_min"]
     record = {
         "clinic_id": doc.clinic_id,
         "clinic_name": doc.clinic_name,
@@ -116,7 +120,11 @@ def _store_row(conn, doc: RawDoc, row: dict, ref_index, seen_prices: dict, queue
         "price": price_info["price"],
         "price_min": price_info["price_min"],
         "price_max": price_info["price_max"],
+        "price_resident": main_price,
+        "price_nonresident": nonresident_price,
+        "price_original": price_info["price_original"],
         "currency": price_info["currency"],
+        "currency_original": price_info["currency_original"],
         "unit": row.get("unit"),
         "duration_days": row.get("duration_days"),
         "source_file": doc.source_file,
@@ -130,6 +138,9 @@ def _store_row(conn, doc: RawDoc, row: dict, ref_index, seen_prices: dict, queue
         "notes": row.get("notes"),
         "dedup_key": dedup_key,
     }
+    flags = sorted(set(flags + validate_record(record)))
+    record["flags"] = flags
+    record["is_verified"], record["verification_note"] = verification_status(record, flags)
     upsert_service(conn, record)
     if canon["ref_service_id"] is None and dedup_key not in queued:
         add_unmatched(conn, record, canon["candidates"])

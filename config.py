@@ -64,6 +64,10 @@ KNOWN_FLAGS = {
     "non_price_row",
     "unmatched_service",
     "kzt_converted_from_usd",
+    "invalid_price",
+    "nonresident_below_resident",
+    "future_date",
+    "price_anomaly",
 }
 
 
