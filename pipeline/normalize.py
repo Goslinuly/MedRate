@@ -112,7 +112,9 @@ def parse_price(raw: Optional[str], currency_raw: Optional[str] = None) -> dict:
         "price": None,
         "price_min": None,
         "price_max": None,
+        "price_original": None,
         "currency": "KZT",
+        "currency_original": None,
         "flags": [],
     }
     if raw is None or not str(raw).strip():
@@ -137,6 +139,8 @@ def parse_price(raw: Optional[str], currency_raw: Optional[str] = None) -> dict:
         else:
             result["price"] = numbers[0]
 
+    result["currency_original"] = currency
+    result["price_original"] = result["price"] if result["price"] is not None else result["price_min"]
     if currency == "USD":
         for key in ("price", "price_min", "price_max"):
             if result[key] is not None:
