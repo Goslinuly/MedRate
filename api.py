@@ -43,6 +43,13 @@ app = FastAPI(
 PRICE = "COALESCE(price, price_min, price_max)"
 
 
+@app.on_event("startup")
+def _ensure_schema():
+    conn = db.connect(check_same_thread=False)
+    db.init_db(conn)
+    conn.close()
+
+
 def _conn():
     return db.connect(check_same_thread=False)
 
@@ -71,10 +78,13 @@ class PartnerPrice(BaseModel):
     city: Optional[str] = None
     service_name_raw: str = Field(examples=["Консультация врача (кмн) первичная"])
     price: Optional[float] = Field(default=None, examples=[16500])
+    price_resident: Optional[float] = Field(default=None, examples=[16500])
+    price_nonresident: Optional[float] = Field(default=None, examples=[20800])
     price_min: Optional[float] = None
     price_max: Optional[float] = None
     currency: Optional[str] = Field(default="KZT", examples=["KZT"])
     unit: Optional[str] = Field(default=None, examples=["посещение"])
+    is_verified: Optional[int] = Field(default=0, examples=[1])
     source_file: Optional[str] = None
     source_year: Optional[int] = None
     parsed_at: Optional[str] = None
@@ -100,10 +110,13 @@ class PartnerServiceItem(BaseModel):
     service_name_raw: str
     category: Optional[str] = None
     price: Optional[float] = None
+    price_resident: Optional[float] = None
+    price_nonresident: Optional[float] = None
     price_min: Optional[float] = None
     price_max: Optional[float] = None
     currency: Optional[str] = None
     unit: Optional[str] = None
+    is_verified: Optional[int] = 0
     source_file: Optional[str] = None
     source_year: Optional[int] = None
     parsed_at: Optional[str] = None
@@ -210,8 +223,9 @@ def service_partners(
     rows = _conn().execute(
         f"""
         SELECT clinic_id AS partner_id, clinic_name AS partner_name, city,
-               service_name_norm, service_name_raw, {PRICE} AS price, price_min, price_max,
-               currency, unit, source_file, source_year, parsed_at, confidence, flags
+               service_name_norm, service_name_raw, {PRICE} AS price,
+               price_resident, price_nonresident, price_min, price_max,
+               currency, unit, is_verified, source_file, source_year, parsed_at, confidence, flags
         FROM services WHERE {where}
         ORDER BY {PRICE} ASC
         """,
@@ -271,8 +285,8 @@ def partner_services(partner_id: str = Path(examples=["clinic_4"]), active_only:
     rows = _conn().execute(
         f"""
         SELECT service_name_norm, service_name_raw, category,
-               {PRICE} AS price, price_min, price_max, currency, unit,
-               source_file, source_year, parsed_at, flags
+               {PRICE} AS price, price_resident, price_nonresident, price_min, price_max,
+               currency, unit, is_verified, source_file, source_year, parsed_at, flags
         FROM services WHERE {where}
         ORDER BY category, service_name_norm
         """,
