@@ -1,15 +1,43 @@
 import json
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Path, Query
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
 import db
+
+try:
+    from scalar_fastapi import get_scalar_api_reference
+except ImportError:
+    get_scalar_api_reference = None
+
+DESCRIPTION = """
+API нормализованной базы прайсов клиник-партнёров.
+
+Архив прайс-листов (PDF / DOCX / XLSX / сканы) разбирается в единую базу: каждая
+строка прайса привязывается к услуге справочника, что позволяет искать
+**кто оказывает услугу и по какой цене**.
+
+* **Услуги** — позиции справочника с числом партнёров и диапазоном цен.
+* **Партнёры** — клиники и их прайсы.
+* **Поиск** — полнотекстовый поиск по услугам и партнёрам.
+* **Сопоставление** — несопоставленные позиции и ручная привязка к справочнику.
+"""
+
+TAGS = [
+    {"name": "Услуги", "description": "Справочник услуг и партнёры, которые их оказывают."},
+    {"name": "Партнёры", "description": "Клиники-партнёры и их прайсы."},
+    {"name": "Поиск", "description": "Полнотекстовый поиск по услугам и партнёрам."},
+    {"name": "Сопоставление", "description": "Очередь несопоставленных позиций и ручная привязка."},
+    {"name": "Сервис", "description": "Служебные метрики обработки."},
+]
 
 app = FastAPI(
     title="MedPartners API",
     version="1.0",
-    description="Поиск медицинских услуг партнёрских клиник, нормализованных по справочнику.",
+    description=DESCRIPTION,
+    openapi_tags=TAGS,
 )
 
 PRICE = "COALESCE(price, price_min, price_max)"
@@ -28,8 +56,118 @@ def _flags(value) -> list[str]:
         return []
 
 
-@app.get("/services")
-def list_services(category: Optional[str] = None, q: Optional[str] = None, limit: int = 200):
+class ServiceSummary(BaseModel):
+    ref_service_id: int = Field(examples=[42])
+    service_name_norm: str = Field(examples=["Прием кардиолога"])
+    category: Optional[str] = Field(default=None, examples=["consultation"])
+    partner_count: int = Field(examples=[4])
+    price_min: Optional[float] = Field(default=None, examples=[9500])
+    price_max: Optional[float] = Field(default=None, examples=[16600])
+
+
+class PartnerPrice(BaseModel):
+    partner_id: str = Field(examples=["clinic_4"])
+    partner_name: str = Field(examples=["Клиника 4"])
+    city: Optional[str] = None
+    service_name_raw: str = Field(examples=["Консультация врача (кмн) первичная"])
+    price: Optional[float] = Field(default=None, examples=[16500])
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    currency: Optional[str] = Field(default="KZT", examples=["KZT"])
+    unit: Optional[str] = Field(default=None, examples=["посещение"])
+    source_file: Optional[str] = None
+    source_year: Optional[int] = None
+    parsed_at: Optional[str] = None
+    confidence: Optional[float] = None
+    flags: list[str] = []
+
+
+class ServicePartners(BaseModel):
+    service_id: int
+    service_name: Optional[str] = None
+    partners: list[PartnerPrice]
+
+
+class PartnerSummary(BaseModel):
+    partner_id: str
+    partner_name: str
+    city: Optional[str] = None
+    service_count: int
+
+
+class PartnerServiceItem(BaseModel):
+    service_name_norm: Optional[str] = None
+    service_name_raw: str
+    category: Optional[str] = None
+    price: Optional[float] = None
+    price_min: Optional[float] = None
+    price_max: Optional[float] = None
+    currency: Optional[str] = None
+    unit: Optional[str] = None
+    source_file: Optional[str] = None
+    source_year: Optional[int] = None
+    parsed_at: Optional[str] = None
+    flags: list[str] = []
+
+
+class PartnerServices(BaseModel):
+    partner_id: str
+    services: list[PartnerServiceItem]
+
+
+class SearchHit(BaseModel):
+    partner_id: str
+    partner_name: str
+    service_name_norm: Optional[str] = None
+    service_name_raw: str
+    ref_service_id: Optional[int] = None
+    price: Optional[float] = None
+    currency: Optional[str] = None
+    unit: Optional[str] = None
+    source_file: Optional[str] = None
+    parsed_at: Optional[str] = None
+
+
+class UnmatchedItem(BaseModel):
+    id: int
+    service_name_raw: str
+    clinic_id: Optional[str] = None
+    source_file: Optional[str] = None
+    candidates: list = []
+
+
+class Stats(BaseModel):
+    price_items: int
+    normalized: int
+    normalized_pct: float
+    partners: int
+    unmatched: int
+
+
+class MatchIn(BaseModel):
+    record_id: int = Field(description="record_id позиции прайса", examples=[101])
+    ref_service_id: int = Field(description="id услуги справочника", examples=[42])
+    service_name_norm: str = Field(examples=["Прием кардиолога"])
+
+
+class MatchResult(BaseModel):
+    record_id: int
+    ref_service_id: int
+    matched: bool
+
+
+@app.get(
+    "/services",
+    response_model=list[ServiceSummary],
+    tags=["Услуги"],
+    summary="Список услуг справочника",
+    description="Услуги, к которым привязан хотя бы один прайс, с числом партнёров и диапазоном цен. Фильтр по категории и подстроке названия.",
+)
+def list_services(
+    category: Optional[str] = Query(default=None, examples=["consultation"]),
+    q: Optional[str] = Query(default=None, description="подстрока названия услуги"),
+    limit: int = 200,
+):
     clauses = ["ref_service_id IS NOT NULL"]
     params: list = []
     if category:
@@ -53,8 +191,17 @@ def list_services(category: Optional[str] = None, q: Optional[str] = None, limit
     return [dict(r) for r in rows]
 
 
-@app.get("/services/{ref_service_id}/partners")
-def service_partners(ref_service_id: int, active_only: bool = True):
+@app.get(
+    "/services/{ref_service_id}/partners",
+    response_model=ServicePartners,
+    tags=["Услуги"],
+    summary="Партнёры, оказывающие услугу",
+    description="Клиники, оказывающие услугу справочника, с ценами (от дешёвых к дорогим).",
+)
+def service_partners(
+    ref_service_id: int = Path(examples=[42]),
+    active_only: bool = True,
+):
     clauses = ["ref_service_id = ?"]
     params: list = [ref_service_id]
     if active_only:
@@ -63,23 +210,29 @@ def service_partners(ref_service_id: int, active_only: bool = True):
     rows = _conn().execute(
         f"""
         SELECT clinic_id AS partner_id, clinic_name AS partner_name, city,
-               service_name_raw, {PRICE} AS price, price_min, price_max, currency, unit,
-               source_file, source_year, parsed_at, confidence, flags
+               service_name_norm, service_name_raw, {PRICE} AS price, price_min, price_max,
+               currency, unit, source_file, source_year, parsed_at, confidence, flags
         FROM services WHERE {where}
         ORDER BY {PRICE} ASC
         """,
         params,
     ).fetchall()
     if not rows:
-        raise HTTPException(status_code=404, detail="service not found or has no partners")
-    name = rows[0]["service_name_raw"]
+        raise HTTPException(status_code=404, detail="услуга не найдена или нет партнёров")
     return {
         "service_id": ref_service_id,
+        "service_name": rows[0]["service_name_norm"],
         "partners": [{**dict(r), "flags": _flags(r["flags"])} for r in rows],
     }
 
 
-@app.get("/partners")
+@app.get(
+    "/partners",
+    response_model=list[PartnerSummary],
+    tags=["Партнёры"],
+    summary="Список партнёров",
+    description="Клиники-партнёры с числом услуг. Фильтр по городу.",
+)
 def list_partners(city: Optional[str] = None, active_only: bool = True):
     clauses: list[str] = []
     params: list = []
@@ -102,8 +255,14 @@ def list_partners(city: Optional[str] = None, active_only: bool = True):
     return [dict(r) for r in rows]
 
 
-@app.get("/partners/{partner_id}/services")
-def partner_services(partner_id: str, active_only: bool = True):
+@app.get(
+    "/partners/{partner_id}/services",
+    response_model=PartnerServices,
+    tags=["Партнёры"],
+    summary="Прайс партнёра",
+    description="Все услуги конкретной клиники с ценами.",
+)
+def partner_services(partner_id: str = Path(examples=["clinic_4"]), active_only: bool = True):
     clauses = ["clinic_id = ?"]
     params: list = [partner_id]
     if active_only:
@@ -120,12 +279,18 @@ def partner_services(partner_id: str, active_only: bool = True):
         params,
     ).fetchall()
     if not rows:
-        raise HTTPException(status_code=404, detail="partner not found")
+        raise HTTPException(status_code=404, detail="партнёр не найден")
     return {"partner_id": partner_id, "services": [{**dict(r), "flags": _flags(r["flags"])} for r in rows]}
 
 
-@app.get("/search")
-def search(q: str, limit: int = 100):
+@app.get(
+    "/search",
+    response_model=list[SearchHit],
+    tags=["Поиск"],
+    summary="Полнотекстовый поиск",
+    description="Поиск по нормализованным и исходным названиям услуг и по названиям партнёров.",
+)
+def search(q: str = Query(examples=["прием кардиолога"]), limit: int = 100):
     like = f"%{q}%"
     rows = _conn().execute(
         f"""
@@ -143,7 +308,13 @@ def search(q: str, limit: int = 100):
     return [dict(r) for r in rows]
 
 
-@app.get("/unmatched")
+@app.get(
+    "/unmatched",
+    response_model=list[UnmatchedItem],
+    tags=["Сопоставление"],
+    summary="Несопоставленные позиции",
+    description="Позиции прайсов, не привязанные к справочнику, с кандидатами для ручной разметки.",
+)
 def list_unmatched(limit: int = 200):
     rows = _conn().execute(
         "SELECT id, service_name_raw, clinic_id, source_file, candidates FROM unmatched_queue ORDER BY id LIMIT ?",
@@ -152,13 +323,13 @@ def list_unmatched(limit: int = 200):
     return [{**dict(r), "candidates": _flags(r["candidates"])} for r in rows]
 
 
-class MatchIn(BaseModel):
-    record_id: int
-    ref_service_id: int
-    service_name_norm: str
-
-
-@app.post("/match")
+@app.post(
+    "/match",
+    response_model=MatchResult,
+    tags=["Сопоставление"],
+    summary="Ручное сопоставление",
+    description="Привязать позицию прайса к услуге справочника вручную.",
+)
 def match(body: MatchIn):
     conn = _conn()
     cur = conn.execute(
@@ -166,12 +337,18 @@ def match(body: MatchIn):
         (body.ref_service_id, body.service_name_norm, body.record_id),
     )
     if cur.rowcount == 0:
-        raise HTTPException(status_code=404, detail="price item not found")
+        raise HTTPException(status_code=404, detail="позиция прайса не найдена")
     conn.commit()
     return {"record_id": body.record_id, "ref_service_id": body.ref_service_id, "matched": True}
 
 
-@app.get("/stats")
+@app.get(
+    "/stats",
+    response_model=Stats,
+    tags=["Сервис"],
+    summary="Метрики обработки",
+    description="Количество позиций, доля нормализованных, число партнёров и размер очереди.",
+)
 def stats():
     conn = _conn()
     total = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
@@ -183,3 +360,10 @@ def stats():
         "partners": conn.execute("SELECT COUNT(DISTINCT clinic_id) FROM services").fetchone()[0],
         "unmatched": conn.execute("SELECT COUNT(*) FROM unmatched_queue").fetchone()[0],
     }
+
+
+if get_scalar_api_reference is not None:
+
+    @app.get("/reference", include_in_schema=False)
+    def scalar_reference():
+        return get_scalar_api_reference(openapi_url=app.openapi_url, title=app.title)
