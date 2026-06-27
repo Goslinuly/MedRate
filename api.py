@@ -1,11 +1,16 @@
 import json
+import tempfile
+import uuid
+from pathlib import Path as FsPath
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Path, Query
-from fastapi.responses import HTMLResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Path, Query, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 import db
+import queries
+from config import CATEGORIES, COARSE_CATEGORIES
 
 try:
     from scalar_fastapi import get_scalar_api_reference
@@ -30,7 +35,9 @@ TAGS = [
     {"name": "Партнёры", "description": "Клиники-партнёры и их прайсы."},
     {"name": "Поиск", "description": "Полнотекстовый поиск по услугам и партнёрам."},
     {"name": "Сопоставление", "description": "Очередь несопоставленных позиций и ручная привязка."},
-    {"name": "Сервис", "description": "Служебные метрики обработки."},
+    {"name": "Верификация", "description": "Очередь ручной верификации позиций оператором."},
+    {"name": "Загрузка", "description": "Загрузка архива прайсов и запуск обработки."},
+    {"name": "Сервис", "description": "Служебные метрики обработки и фильтры."},
 ]
 
 app = FastAPI(
@@ -38,6 +45,13 @@ app = FastAPI(
     version="1.0",
     description=DESCRIPTION,
     openapi_tags=TAGS,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 PRICE = "COALESCE(price, price_min, price_max)"
@@ -155,18 +169,98 @@ class Stats(BaseModel):
     normalized_pct: float
     partners: int
     unmatched: int
+    verified: int
+    needs_review: int
+    flags: dict[str, int] = {}
+    ingest_log: list[dict] = []
+
+
+class FilterOptions(BaseModel):
+    cities: list[str] = []
+    categories: list[dict] = []
+    clinics: list[dict] = []
+
+
+class ClinicYearPrice(BaseModel):
+    partner_id: str
+    partner_name: str
+    source_year: Optional[int] = None
+    price: Optional[float] = None
+    is_active: Optional[int] = 1
+
+
+class ServiceHistory(BaseModel):
+    service_id: int
+    service_name: Optional[str] = None
+    points: list[ClinicYearPrice] = []
+
+
+class VerificationItem(BaseModel):
+    record_id: int
+    clinic_id: Optional[str] = None
+    clinic_name: Optional[str] = None
+    service_name_raw: str
+    service_name_norm: Optional[str] = None
+    ref_service_id: Optional[int] = None
+    category: Optional[str] = None
+    price: Optional[float] = None
+    price_resident: Optional[float] = None
+    price_nonresident: Optional[float] = None
+    currency: Optional[str] = None
+    unit: Optional[str] = None
+    confidence: Optional[float] = None
+    verification_note: Optional[str] = None
+    source_file: Optional[str] = None
+    source_page: Optional[int] = None
+    source_year: Optional[int] = None
+    flags: list[str] = []
+
+
+class VerifyIn(BaseModel):
+    record_id: int = Field(examples=[101])
+    action: str = Field(description="approve | reject | correct", examples=["approve"])
+    price_resident: Optional[float] = None
+    price_nonresident: Optional[float] = None
+    service_name_norm: Optional[str] = None
+    ref_service_id: Optional[int] = None
+    note: Optional[str] = None
+
+
+class VerifyResult(BaseModel):
+    record_id: int
+    action: str
+    is_verified: int
+    is_active: int
+
+
+class IngestStarted(BaseModel):
+    job_id: str
+    files_received: int
+
+
+class IngestStatus(BaseModel):
+    job_id: str
+    state: str
+    files: int = 0
+    services: int = 0
+    normalized: int = 0
+    failed_files: int = 0
+    error: Optional[str] = None
 
 
 class MatchIn(BaseModel):
-    record_id: int = Field(description="record_id позиции прайса", examples=[101])
     ref_service_id: int = Field(description="id услуги справочника", examples=[42])
     service_name_norm: str = Field(examples=["Прием кардиолога"])
+    record_id: Optional[int] = Field(default=None, description="record_id позиции прайса", examples=[101])
+    queue_id: Optional[int] = Field(default=None, description="id записи из очереди /unmatched", examples=[7])
+    clinic_id: Optional[str] = Field(default=None, examples=["clinic_4"])
+    service_name_raw: Optional[str] = Field(default=None, examples=["Озонотерапия лица"])
 
 
 class MatchResult(BaseModel):
-    record_id: int
     ref_service_id: int
     matched: bool
+    affected: int
 
 
 @app.get(
@@ -346,14 +440,34 @@ def list_unmatched(limit: int = 200):
 )
 def match(body: MatchIn):
     conn = _conn()
-    cur = conn.execute(
-        "UPDATE services SET ref_service_id = ?, service_name_norm = ? WHERE record_id = ?",
-        (body.ref_service_id, body.service_name_norm, body.record_id),
-    )
+    if body.record_id is not None:
+        cur = conn.execute(
+            "UPDATE services SET ref_service_id = ?, service_name_norm = ? WHERE record_id = ?",
+            (body.ref_service_id, body.service_name_norm, body.record_id),
+        )
+    elif body.clinic_id and body.service_name_raw:
+        cur = conn.execute(
+            """
+            UPDATE services SET ref_service_id = ?, service_name_norm = ?
+            WHERE clinic_id = ? AND service_name_raw = ? AND ref_service_id IS NULL
+            """,
+            (body.ref_service_id, body.service_name_norm, body.clinic_id, body.service_name_raw),
+        )
+    else:
+        raise HTTPException(status_code=400, detail="нужен record_id или (clinic_id + service_name_raw)")
+
     if cur.rowcount == 0:
         raise HTTPException(status_code=404, detail="позиция прайса не найдена")
+
+    if body.queue_id is not None:
+        conn.execute("DELETE FROM unmatched_queue WHERE id = ?", (body.queue_id,))
+    elif body.clinic_id and body.service_name_raw:
+        conn.execute(
+            "DELETE FROM unmatched_queue WHERE clinic_id = ? AND service_name_raw = ?",
+            (body.clinic_id, body.service_name_raw),
+        )
     conn.commit()
-    return {"record_id": body.record_id, "ref_service_id": body.ref_service_id, "matched": True}
+    return {"ref_service_id": body.ref_service_id, "matched": True, "affected": cur.rowcount}
 
 
 @app.get(
@@ -367,13 +481,221 @@ def stats():
     conn = _conn()
     total = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
     normalized = conn.execute("SELECT COUNT(*) FROM services WHERE service_name_norm IS NOT NULL").fetchone()[0]
+    verified = conn.execute("SELECT COUNT(*) FROM services WHERE is_verified = 1").fetchone()[0]
+
+    flag_counts: dict[str, int] = {}
+    for (value,) in conn.execute("SELECT flags FROM services WHERE flags IS NOT NULL AND flags != '[]'"):
+        for flag in _flags(value):
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+    log = [dict(r) for r in conn.execute(
+        "SELECT source_file, stage, status, reason, created_at FROM ingest_log ORDER BY id DESC LIMIT 30"
+    ).fetchall()]
+
     return {
         "price_items": total,
         "normalized": normalized,
         "normalized_pct": round(100 * normalized / total, 1) if total else 0,
         "partners": conn.execute("SELECT COUNT(DISTINCT clinic_id) FROM services").fetchone()[0],
         "unmatched": conn.execute("SELECT COUNT(*) FROM unmatched_queue").fetchone()[0],
+        "verified": verified,
+        "needs_review": total - verified,
+        "flags": dict(sorted(flag_counts.items(), key=lambda kv: kv[1], reverse=True)),
+        "ingest_log": log,
     }
+
+
+@app.get(
+    "/filters",
+    response_model=FilterOptions,
+    tags=["Сервис"],
+    summary="Опции фильтров",
+    description="Города, категории (с русскими подписями) и клиники для выпадающих списков UI.",
+)
+def filters():
+    conn = _conn()
+    cities = queries.distinct_values(conn, "city")
+    present = queries.distinct_values(conn, "category")
+    categories = [
+        {"value": cat, "label": COARSE_CATEGORIES.get(cat, cat)}
+        for cat in CATEGORIES
+        if cat in present
+    ]
+    clinics = [
+        {"partner_id": cid, "partner_name": name}
+        for name, cid in queries.clinic_options(conn).items()
+    ]
+    return {"cities": cities, "categories": categories, "clinics": clinics}
+
+
+@app.get(
+    "/services/{ref_service_id}/history",
+    response_model=ServiceHistory,
+    tags=["Услуги"],
+    summary="История цен услуги",
+    description="Цены по годам для услуги справочника, сгруппированные по клинике — для графика истории.",
+)
+def service_history(ref_service_id: int = Path(examples=[42])):
+    rows = _conn().execute(
+        f"""
+        SELECT clinic_id AS partner_id, clinic_name AS partner_name,
+               source_year, {PRICE} AS price, is_active, service_name_norm
+        FROM services
+        WHERE ref_service_id = ? AND source_year IS NOT NULL AND {PRICE} IS NOT NULL
+        ORDER BY partner_name, source_year
+        """,
+        (ref_service_id,),
+    ).fetchall()
+    name = rows[0]["service_name_norm"] if rows else None
+    return {
+        "service_id": ref_service_id,
+        "service_name": name,
+        "points": [
+            {k: r[k] for k in ("partner_id", "partner_name", "source_year", "price", "is_active")}
+            for r in rows
+        ],
+    }
+
+
+@app.get(
+    "/verification",
+    response_model=list[VerificationItem],
+    tags=["Верификация"],
+    summary="Очередь верификации",
+    description="Позиции прайсов, требующие ручной верификации (is_verified = 0): с флагами, причиной и ценами рез/нерез.",
+)
+def verification_queue(
+    flag: Optional[str] = Query(default=None, description="фильтр по флагу, напр. price_anomaly"),
+    limit: int = 200,
+):
+    clauses = ["is_verified = 0"]
+    params: list = []
+    if flag:
+        clauses.append("flags LIKE ?")
+        params.append(f'%"{flag}"%')
+    where = " AND ".join(clauses)
+    rows = _conn().execute(
+        f"""
+        SELECT record_id, clinic_id, clinic_name, service_name_raw, service_name_norm,
+               ref_service_id, category, {PRICE} AS price, price_resident, price_nonresident,
+               currency, unit, confidence, verification_note, source_file, source_page,
+               source_year, flags
+        FROM services WHERE {where}
+        ORDER BY confidence ASC, record_id LIMIT ?
+        """,
+        (*params, limit),
+    ).fetchall()
+    return [{**dict(r), "flags": _flags(r["flags"])} for r in rows]
+
+
+@app.post(
+    "/verify",
+    response_model=VerifyResult,
+    tags=["Верификация"],
+    summary="Верифицировать позицию",
+    description="Подтвердить (approve), отклонить (reject) или исправить (correct) позицию прайса.",
+)
+def verify(body: VerifyIn):
+    conn = _conn()
+    row = conn.execute(
+        "SELECT is_active FROM services WHERE record_id = ?", (body.record_id,)
+    ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="позиция прайса не найдена")
+
+    if body.action == "reject":
+        conn.execute(
+            "UPDATE services SET is_active = 0, is_verified = 0, verification_note = ? WHERE record_id = ?",
+            (body.note or "отклонено оператором", body.record_id),
+        )
+        conn.commit()
+        return {"record_id": body.record_id, "action": "reject", "is_verified": 0, "is_active": 0}
+
+    if body.action == "correct":
+        sets = ["is_verified = 1", "verification_note = ?"]
+        params: list = [body.note or "исправлено оператором"]
+        for column, value in (
+            ("price_resident", body.price_resident),
+            ("price_nonresident", body.price_nonresident),
+            ("price", body.price_resident),
+            ("service_name_norm", body.service_name_norm),
+            ("ref_service_id", body.ref_service_id),
+        ):
+            if value is not None:
+                sets.append(f"{column} = ?")
+                params.append(value)
+        params.append(body.record_id)
+        conn.execute(f"UPDATE services SET {', '.join(sets)} WHERE record_id = ?", params)
+        conn.commit()
+        return {"record_id": body.record_id, "action": "correct", "is_verified": 1, "is_active": 1}
+
+    if body.action == "approve":
+        conn.execute(
+            "UPDATE services SET is_verified = 1, verification_note = ? WHERE record_id = ?",
+            (body.note or "", body.record_id),
+        )
+        conn.commit()
+        return {"record_id": body.record_id, "action": "approve", "is_verified": 1, "is_active": 1}
+
+    raise HTTPException(status_code=400, detail="action должно быть approve | reject | correct")
+
+
+_INGEST_JOBS: dict[str, dict] = {}
+
+
+def _run_ingest(job_id: str, paths: list[FsPath], reset: bool) -> None:
+    from pipeline.process import process_paths
+
+    conn = db.connect(check_same_thread=False)
+    db.init_db(conn)
+    try:
+        if reset:
+            db.clear_pipeline_tables(conn)
+        stats_result = process_paths(paths, conn)
+        _INGEST_JOBS[job_id] = {"state": "done", **stats_result}
+    except Exception as error:  # noqa: BLE001
+        _INGEST_JOBS[job_id] = {"state": "error", "error": f"{type(error).__name__}: {error}"}
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/ingest",
+    response_model=IngestStarted,
+    tags=["Загрузка"],
+    summary="Загрузить и обработать прайсы",
+    description="Принимает архив(ы) ZIP или отдельные файлы прайсов и запускает обработку в фоне. Статус — GET /ingest/status/{job_id}.",
+)
+async def ingest_upload(
+    background: BackgroundTasks,
+    files: list[UploadFile] = File(...),
+    reset: bool = Form(default=False),
+):
+    job_dir = FsPath(tempfile.mkdtemp(prefix="medrate_ingest_"))
+    saved: list[FsPath] = []
+    for upload in files:
+        destination = job_dir / (upload.filename or f"file_{len(saved)}")
+        destination.write_bytes(await upload.read())
+        saved.append(destination)
+
+    job_id = uuid.uuid4().hex
+    _INGEST_JOBS[job_id] = {"state": "running"}
+    background.add_task(_run_ingest, job_id, saved, reset)
+    return {"job_id": job_id, "files_received": len(saved)}
+
+
+@app.get(
+    "/ingest/status/{job_id}",
+    response_model=IngestStatus,
+    tags=["Загрузка"],
+    summary="Статус обработки",
+    description="Состояние фоновой задачи обработки архива.",
+)
+def ingest_status(job_id: str):
+    job = _INGEST_JOBS.get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="задача не найдена")
+    return {"job_id": job_id, **job}
 
 
 if get_scalar_api_reference is not None:

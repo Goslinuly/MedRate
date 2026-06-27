@@ -11,4 +11,5 @@ rapidfuzz
 python-dotenv
 fastapi
 uvicorn[standard]
+python-multipart
 scalar-fastapi

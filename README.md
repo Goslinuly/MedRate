@@ -91,7 +91,9 @@ Unmatched services land in a separate `unmatched_queue` for manual review; raw m
 - **Pillow** — image handling
 - **rapidfuzz** — fuzzy reference matching
 - **SQLite** — storage
-- **Streamlit** — web UI
+- **FastAPI** (+ Scalar) — REST API with OpenAPI docs
+- **Next.js 16** (React 19, TypeScript, Tailwind) — product web UI (`web/`)
+- **Streamlit** — legacy/analyst UI (`app.py`, kept as a fallback)
 
 ---
 
@@ -112,12 +114,36 @@ pip install -r requirements.txt
 
 # 4. API key
 cp .env.example .env        # add your GOOGLE_API_KEY
+```
 
-# 5. Run the app
+### Web product UI (recommended)
+
+The product experience is a Next.js frontend on top of the FastAPI backend, split into a
+public search and an operator panel.
+
+```bash
+# Terminal 1 — backend API (http://localhost:8000, docs at /docs and /reference)
+uvicorn api:app --port 8000
+
+# Terminal 2 — frontend (http://localhost:3000)
+cd web
+npm install
+npm run dev
+```
+
+Open **http://localhost:3000**:
+- **Public** — search a service → clinics with **resident / non-resident** prices, cheapest highlighted, price history; clinic cards with full price lists.
+- **Operator panel** (`/admin`) — dashboard (normalization %, flags, ingest log), **upload an archive** (drag-drop → background processing), **verification queue** (approve / correct / reject), and the **unmatched** matching queue.
+
+> The frontend expects the API at `http://localhost:8000` (`web/.env.local` → `NEXT_PUBLIC_API_BASE`). CORS is enabled for `localhost:3000`.
+
+### Legacy Streamlit UI
+
+```bash
 streamlit run app.py
 ```
 
-In the app: upload a `.zip` or files in the sidebar and press **Обработать загруженное**, or press **Обработать data/samples/** to process the bundled sample archive. Then search, filter, compare clinics, view price history, and export.
+Upload a `.zip` or files in the sidebar and press **Обработать загруженное**, or press **Обработать data/samples/** to process the bundled sample archive. Then search, filter, compare clinics, view price history, and export.
 
 ### Headless processing
 
@@ -132,7 +158,12 @@ python run_pipeline.py path/to/archive.zip --reset
 
 ```
 MedRate/
-├── app.py                  # Streamlit UI
+├── api.py                  # FastAPI REST API (OpenAPI docs, CORS, ingest, verification)
+├── web/                    # Next.js product UI (public search + operator panel)
+│   ├── app/                # routes: /, /service/[id], /clinic/[id], /partners, /admin/*
+│   ├── components/         # PriceCell (рез/нерез), VerifiedBadge, FlagTag, HistoryChart…
+│   └── lib/api.ts          # typed client for the FastAPI backend
+├── app.py                  # legacy Streamlit UI
 ├── run_pipeline.py         # headless pipeline runner
 ├── config.py               # env, models, paths, categories, flags
 ├── db.py                   # SQLite schema, upserts, cache, logging
