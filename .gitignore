@@ -1,13 +1,54 @@
+# Environment
 .env
+.env.local
+
+# Virtual environments
 .venv/
 venv/
+env/
+
+# Python cache
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+*.pycache
+
+# Database
 *.db
 *.db-wal
 *.db-shm
 *.sqlite
 *.sqlite3
+
+# Output files
 output.xlsx
+
+# OS
 .DS_Store
+Thumbs.db
+desktop.ini
+
+# Streamlit
 .streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# Claude Code
+.claude/
+
+# Temporary upload dir
+medrate_upload_*/
+medrate_*/
+
+# Logs
+*.log
+
+# Next.js scaffold artifacts (unused: agent docs & default Vercel/Next SVGs)
+web/AGENTS.md
+web/CLAUDE.md
+web/README.md
+web/public/*.svg

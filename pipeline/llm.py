@@ -1,9 +1,9 @@
 import base64
 import hashlib
 import json
+import re
 import time
 from functools import lru_cache
-from typing import Optional
 
 from google import genai
 from google.genai import errors, types
@@ -17,6 +17,18 @@ BASE_DELAY = 2.0
 EXTRACT_MAX_TOKENS = 32768
 NORMALIZE_MAX_TOKENS = 512
 RETRYABLE_CODES = {500, 502, 503, 504}
+RATE_LIMIT_CODE = 429
+RATE_LIMIT_MAX_RETRIES = 6
+RATE_LIMIT_DELAY = 40.0
+_RETRY_DELAY_RE = re.compile(r"retryDelay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s")
+
+
+def _rate_limit_delay(error: Exception) -> float:
+    """Honour the retryDelay Gemini suggests in a 429, else fall back to a safe wait."""
+    match = _RETRY_DELAY_RE.search(str(error))
+    if match:
+        return min(float(match.group(1)) + 2.0, 65.0)
+    return RATE_LIMIT_DELAY
 
 
 @lru_cache(maxsize=None)
@@ -40,18 +52,23 @@ def _call(model: str, system: str, contents: list, max_tokens: int) -> str:
     )
     if model.startswith("gemini-2.5"):
         config.thinking_config = types.ThinkingConfig(thinking_budget=0)
-    last_error: Optional[Exception] = None
-    for attempt in range(MAX_RETRIES):
+    attempt = 0
+    rate_limit_hits = 0
+    while True:
         try:
             response = _client().models.generate_content(model=model, contents=contents, config=config)
             return response.text or ""
         except errors.APIError as error:
-            last_error = error
-            if getattr(error, "code", None) in RETRYABLE_CODES and attempt < MAX_RETRIES - 1:
+            code = getattr(error, "code", None)
+            if code == RATE_LIMIT_CODE and rate_limit_hits < RATE_LIMIT_MAX_RETRIES:
+                rate_limit_hits += 1
+                time.sleep(_rate_limit_delay(error))
+                continue
+            if code in RETRYABLE_CODES and attempt < MAX_RETRIES - 1:
                 time.sleep(BASE_DELAY * (2**attempt))
+                attempt += 1
                 continue
             raise
-    raise RuntimeError(f"LLM call failed after {MAX_RETRIES} attempts: {last_error}")
 
 
 def _strip_json(text: str) -> str:
