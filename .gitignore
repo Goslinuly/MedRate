@@ -44,6 +44,10 @@ desktop.ini
 medrate_upload_*/
 medrate_*/
 
+# Saved originals & uploaded catalogue
+data/uploads/
+data/reference/services.json
+
 # Logs
 *.log
 

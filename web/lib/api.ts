@@ -43,11 +43,23 @@ export type PartnerPrice = {
   parsed_at: string | null;
   confidence: number | null;
   flags: string[];
+  delta_pct: number | null;
+  is_outlier: boolean;
+};
+
+export type MarketStats = {
+  count: number;
+  median: number | null;
+  p25: number | null;
+  p75: number | null;
+  min: number | null;
+  max: number | null;
 };
 
 export type ServicePartners = {
   service_id: number;
   service_name: string | null;
+  market: MarketStats | null;
   partners: PartnerPrice[];
 };
 
@@ -174,6 +186,19 @@ export const api = {
     clinic_id?: string;
     service_name_raw?: string;
   }) => post<{ ref_service_id: number; matched: boolean; affected: number }>("/match", body),
+  referenceSearch: (q: string) =>
+    get<{ id: number; name: string; specialty: string | null; category: string | null }[]>(
+      `/reference/search?q=${encodeURIComponent(q)}`,
+    ),
+  referenceCreate: (body: { name: string; category?: string; specialty?: string }) =>
+    post<{ ref_service_id: number; service_name_norm: string }>("/reference", body),
+  referenceUpload: async (file: File) => {
+    const form = new FormData();
+    form.append("file", file);
+    const res = await fetch(`${BASE}/reference/upload`, { method: "POST", body: form });
+    if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+    return res.json() as Promise<{ rows: number; file: string }>;
+  },
   ingest: async (files: File[], reset: boolean) => {
     const form = new FormData();
     files.forEach((f) => form.append("files", f));
@@ -182,6 +207,59 @@ export const api = {
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
     return res.json() as Promise<{ job_id: string; files_received: number }>;
   },
+  documents: () =>
+    get<
+      {
+        doc_id: string;
+        partner_id: string | null;
+        file_name: string;
+        file_format: string | null;
+        parse_status: string | null;
+        parse_log: string | null;
+        chunks: number | null;
+        parsed_at: string | null;
+      }[]
+    >("/documents"),
+  documentPageUrl: (file: string, page: number) =>
+    `${BASE}/documents/page?file=${encodeURIComponent(file)}&page=${page}`,
+  documentFileUrl: (file: string) => `${BASE}/documents/file?file=${encodeURIComponent(file)}`,
+  basketOptimize: (body: { service_ids: number[]; resident: boolean; city?: string }) =>
+    post<{
+      requested: number[];
+      cheapest_total: number;
+      cheapest_items: {
+        ref_service_id: number;
+        service_name: string | null;
+        partner_id: string;
+        partner_name: string;
+        price: number;
+      }[];
+      missing_anywhere: number[];
+      by_clinic: {
+        partner_id: string;
+        partner_name: string;
+        city: string | null;
+        covered: number;
+        total_requested: number;
+        total_price: number;
+        items: { ref_service_id: number; service_name: string | null; price: number }[];
+        missing: number[];
+      }[];
+    }>("/basket/optimize", body),
+  reportUrl: () => `${BASE}/report/quality`,
+  partnersGeo: () =>
+    get<
+      {
+        partner_id: string;
+        partner_name: string;
+        city: string | null;
+        address: string | null;
+        lat: number;
+        lon: number;
+        service_count: number;
+      }[]
+    >("/partners/geo"),
+  geocode: () => post<{ geocoded: number; remaining: number }>("/partners/geocode", {}),
   ingestStatus: (jobId: string) =>
     get<{
       job_id: string;

@@ -21,16 +21,26 @@ def _iter_blocks(document: DocumentType):
             yield Table(child, document)
 
 
+def _accepted_text(element) -> str:
+    """Text with all tracked changes accepted.
+
+    Collecting every ``w:t`` descendant naturally accepts insertions (their text
+    lives in ``w:ins/w:r/w:t``) and drops deletions (deleted text is stored in
+    ``w:delText``, not ``w:t``) — i.e. the final, accepted version of the document.
+    """
+    return "".join(node.text or "" for node in element.xpath(".//w:t")).strip()
+
+
 def _document_lines(document: DocumentType) -> list[str]:
     lines = []
     for block in _iter_blocks(document):
         if isinstance(block, Paragraph):
-            text = block.text.strip()
+            text = _accepted_text(block._p)
             if text:
                 lines.append(text)
         else:
             for row in block.rows:
-                cells = [cell.text.strip() for cell in row.cells]
+                cells = [_accepted_text(cell._tc) for cell in row.cells]
                 if any(cells):
                     lines.append(" | ".join(cells))
     return lines
