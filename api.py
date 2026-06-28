@@ -1,16 +1,21 @@
 import json
 import tempfile
 import uuid
+from io import BytesIO
 from pathlib import Path as FsPath
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Path, Query, UploadFile
+import sqlite3
+
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Path, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 import db
 import queries
-from config import CATEGORIES, COARSE_CATEGORIES
+from config import CATEGORIES, COARSE_CATEGORIES, REFERENCE_DIR, REFERENCE_FILE, UPLOADS_DIR
+from pipeline.normalize import build_ref_index, load_reference_rows
 
 try:
     from scalar_fastapi import get_scalar_api_reference
@@ -37,6 +42,7 @@ TAGS = [
     {"name": "Сопоставление", "description": "Очередь несопоставленных позиций и ручная привязка."},
     {"name": "Верификация", "description": "Очередь ручной верификации позиций оператором."},
     {"name": "Загрузка", "description": "Загрузка архива прайсов и запуск обработки."},
+    {"name": "Аналитика", "description": "Рыночные метрики, корзина обследований, отчёт о качестве."},
     {"name": "Сервис", "description": "Служебные метрики обработки и фильтры."},
 ]
 
@@ -64,8 +70,31 @@ def _ensure_schema():
     conn.close()
 
 
-def _conn():
-    return db.connect(check_same_thread=False)
+def get_db():
+    conn = db.connect(check_same_thread=False)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+_REF_INDEX = None
+
+
+def _ref_index():
+    global _REF_INDEX
+    if _REF_INDEX is None:
+        conn = db.connect(check_same_thread=False)
+        try:
+            _REF_INDEX = build_ref_index(conn)
+        finally:
+            conn.close()
+    return _REF_INDEX
+
+
+def _invalidate_ref_index():
+    global _REF_INDEX
+    _REF_INDEX = None
 
 
 def _flags(value) -> list[str]:
@@ -75,6 +104,34 @@ def _flags(value) -> list[str]:
         return json.loads(value)
     except (json.JSONDecodeError, TypeError):
         return []
+
+
+def _percentile(sorted_values: list[float], q: float) -> float:
+    """Linear-interpolated percentile (q in 0..1) over a pre-sorted list."""
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    pos = q * (len(sorted_values) - 1)
+    low = int(pos)
+    frac = pos - low
+    if low + 1 >= len(sorted_values):
+        return sorted_values[low]
+    return sorted_values[low] + frac * (sorted_values[low + 1] - sorted_values[low])
+
+
+def _market_stats(prices: list[float]) -> dict:
+    values = sorted(p for p in prices if p is not None and p > 0)
+    if not values:
+        return {"count": 0, "median": None, "p25": None, "p75": None, "min": None, "max": None}
+    return {
+        "count": len(values),
+        "median": round(_percentile(values, 0.5), 2),
+        "p25": round(_percentile(values, 0.25), 2),
+        "p75": round(_percentile(values, 0.75), 2),
+        "min": values[0],
+        "max": values[-1],
+    }
 
 
 class ServiceSummary(BaseModel):
@@ -104,11 +161,23 @@ class PartnerPrice(BaseModel):
     parsed_at: Optional[str] = None
     confidence: Optional[float] = None
     flags: list[str] = []
+    delta_pct: Optional[float] = Field(default=None, description="отклонение от медианы рынка, %", examples=[-18.0])
+    is_outlier: bool = Field(default=False, description="ценовой выброс (подозрительно дорого)")
+
+
+class MarketStats(BaseModel):
+    count: int
+    median: Optional[float] = None
+    p25: Optional[float] = None
+    p75: Optional[float] = None
+    min: Optional[float] = None
+    max: Optional[float] = None
 
 
 class ServicePartners(BaseModel):
     service_id: int
     service_name: Optional[str] = None
+    market: Optional[MarketStats] = None
     partners: list[PartnerPrice]
 
 
@@ -274,6 +343,7 @@ def list_services(
     category: Optional[str] = Query(default=None, examples=["consultation"]),
     q: Optional[str] = Query(default=None, description="подстрока названия услуги"),
     limit: int = 200,
+    conn: sqlite3.Connection = Depends(get_db),
 ):
     clauses = ["ref_service_id IS NOT NULL"]
     params: list = []
@@ -284,7 +354,7 @@ def list_services(
         clauses.append("ulower(service_name_norm) LIKE ulower(?)")
         params.append(f"%{q}%")
     where = " AND ".join(clauses)
-    rows = _conn().execute(
+    rows = conn.execute(
         f"""
         SELECT ref_service_id, service_name_norm, category,
                COUNT(DISTINCT clinic_id) AS partner_count,
@@ -308,13 +378,14 @@ def list_services(
 def service_partners(
     ref_service_id: int = Path(examples=[42]),
     active_only: bool = True,
+    conn: sqlite3.Connection = Depends(get_db),
 ):
     clauses = ["ref_service_id = ?"]
     params: list = [ref_service_id]
     if active_only:
         clauses.append("is_active = 1")
     where = " AND ".join(clauses)
-    rows = _conn().execute(
+    rows = conn.execute(
         f"""
         SELECT clinic_id AS partner_id, clinic_name AS partner_name, city,
                service_name_norm, service_name_raw, {PRICE} AS price,
@@ -327,10 +398,33 @@ def service_partners(
     ).fetchall()
     if not rows:
         raise HTTPException(status_code=404, detail="услуга не найдена или нет партнёров")
+
+    def eff_price(r) -> Optional[float]:
+        return r["price_resident"] if r["price_resident"] is not None else r["price"]
+
+    market = _market_stats([eff_price(r) for r in rows])
+    median = market["median"]
+    p75 = market["p75"]
+    p25 = market["p25"]
+    iqr = (p75 - p25) if (p75 is not None and p25 is not None) else 0
+    outlier_threshold = (p75 + 1.5 * iqr) if p75 is not None else None
+
+    partners = []
+    for r in rows:
+        price = eff_price(r)
+        delta_pct = None
+        is_outlier = False
+        if price is not None and median:
+            delta_pct = round((price - median) / median * 100, 1)
+            if outlier_threshold is not None and price > outlier_threshold and market["count"] >= 4:
+                is_outlier = True
+        partners.append({**dict(r), "flags": _flags(r["flags"]), "delta_pct": delta_pct, "is_outlier": is_outlier})
+
     return {
         "service_id": ref_service_id,
         "service_name": rows[0]["service_name_norm"],
-        "partners": [{**dict(r), "flags": _flags(r["flags"])} for r in rows],
+        "market": market,
+        "partners": partners,
     }
 
 
@@ -341,7 +435,7 @@ def service_partners(
     summary="Список партнёров",
     description="Клиники-партнёры с числом услуг. Фильтр по городу.",
 )
-def list_partners(city: Optional[str] = None, active_only: bool = True):
+def list_partners(city: Optional[str] = None, active_only: bool = True, conn: sqlite3.Connection = Depends(get_db)):
     clauses: list[str] = []
     params: list = []
     if city:
@@ -350,7 +444,7 @@ def list_partners(city: Optional[str] = None, active_only: bool = True):
     if active_only:
         clauses.append("is_active = 1")
     where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    rows = _conn().execute(
+    rows = conn.execute(
         f"""
         SELECT clinic_id AS partner_id, clinic_name AS partner_name, city,
                COUNT(*) AS service_count
@@ -370,13 +464,13 @@ def list_partners(city: Optional[str] = None, active_only: bool = True):
     summary="Прайс партнёра",
     description="Все услуги конкретной клиники с ценами.",
 )
-def partner_services(partner_id: str = Path(examples=["clinic_4"]), active_only: bool = True):
+def partner_services(partner_id: str = Path(examples=["clinic_4"]), active_only: bool = True, conn: sqlite3.Connection = Depends(get_db)):
     clauses = ["clinic_id = ?"]
     params: list = [partner_id]
     if active_only:
         clauses.append("is_active = 1")
     where = " AND ".join(clauses)
-    rows = _conn().execute(
+    rows = conn.execute(
         f"""
         SELECT service_name_norm, service_name_raw, category,
                {PRICE} AS price, price_resident, price_nonresident, price_min, price_max,
@@ -398,9 +492,9 @@ def partner_services(partner_id: str = Path(examples=["clinic_4"]), active_only:
     summary="Полнотекстовый поиск",
     description="Поиск по нормализованным и исходным названиям услуг и по названиям партнёров.",
 )
-def search(q: str = Query(examples=["прием кардиолога"]), limit: int = 100):
+def search(q: str = Query(examples=["прием кардиолога"]), limit: int = 100, conn: sqlite3.Connection = Depends(get_db)):
     like = f"%{q}%"
-    rows = _conn().execute(
+    rows = conn.execute(
         f"""
         SELECT clinic_id AS partner_id, clinic_name AS partner_name,
                service_name_norm, service_name_raw, ref_service_id,
@@ -423,8 +517,8 @@ def search(q: str = Query(examples=["прием кардиолога"]), limit: 
     summary="Несопоставленные позиции",
     description="Позиции прайсов, не привязанные к справочнику, с кандидатами для ручной разметки.",
 )
-def list_unmatched(limit: int = 200):
-    rows = _conn().execute(
+def list_unmatched(limit: int = 200, conn: sqlite3.Connection = Depends(get_db)):
+    rows = conn.execute(
         "SELECT id, service_name_raw, clinic_id, source_file, candidates FROM unmatched_queue ORDER BY id LIMIT ?",
         (limit,),
     ).fetchall()
@@ -438,8 +532,7 @@ def list_unmatched(limit: int = 200):
     summary="Ручное сопоставление",
     description="Привязать позицию прайса к услуге справочника вручную.",
 )
-def match(body: MatchIn):
-    conn = _conn()
+def match(body: MatchIn, conn: sqlite3.Connection = Depends(get_db)):
     if body.record_id is not None:
         cur = conn.execute(
             "UPDATE services SET ref_service_id = ?, service_name_norm = ? WHERE record_id = ?",
@@ -470,6 +563,429 @@ def match(body: MatchIn):
     return {"ref_service_id": body.ref_service_id, "matched": True, "affected": cur.rowcount}
 
 
+class RefEntry(BaseModel):
+    id: int
+    name: str
+    specialty: Optional[str] = None
+    category: Optional[str] = None
+
+
+class RefCreateIn(BaseModel):
+    name: str = Field(examples=["Озонотерапия лица"])
+    category: Optional[str] = Field(default=None, examples=["procedures"])
+    specialty: Optional[str] = None
+
+
+class RefCreateResult(BaseModel):
+    ref_service_id: int
+    service_name_norm: str
+
+
+class RefUploadResult(BaseModel):
+    rows: int
+    file: str
+
+
+@app.get(
+    "/reference/search",
+    response_model=list[RefEntry],
+    tags=["Сопоставление"],
+    summary="Поиск по справочнику",
+    description="Поиск услуг во всём справочнике — для ручной привязки к любой позиции, не только к кандидатам.",
+)
+def reference_search(q: str = Query(examples=["кардиолог"]), limit: int = 20):
+    return [
+        {"id": e["id"], "name": e["name"], "specialty": e.get("specialty"), "category": e.get("category")}
+        for e in _ref_index().search(q, limit)
+    ]
+
+
+@app.post(
+    "/reference",
+    response_model=RefCreateResult,
+    tags=["Сопоставление"],
+    summary="Создать позицию справочника",
+    description="Оператор добавляет новую услугу в справочник (когда подходящей нет среди кандидатов).",
+)
+def reference_create(body: RefCreateIn, conn: sqlite3.Connection = Depends(get_db)):
+    if not body.name.strip():
+        raise HTTPException(status_code=400, detail="название не может быть пустым")
+    ref_id = db.add_reference(conn, body.name, body.category or "", body.specialty or "")
+    _invalidate_ref_index()
+    return {"ref_service_id": ref_id, "service_name_norm": body.name.strip()}
+
+
+@app.post(
+    "/reference/upload",
+    response_model=RefUploadResult,
+    tags=["Загрузка"],
+    summary="Загрузить справочник",
+    description="Загрузка целевого справочника услуг в формате XLSX или JSON (заменяет текущий).",
+)
+async def reference_upload(file: UploadFile = File(...)):
+    name = (file.filename or "").lower()
+    REFERENCE_DIR.mkdir(parents=True, exist_ok=True)
+    if name.endswith(".json"):
+        dest = REFERENCE_DIR / "services.json"
+        dest.write_bytes(await file.read())
+    elif name.endswith(".xlsx"):
+        dest = REFERENCE_FILE
+        dest.write_bytes(await file.read())
+        json_path = REFERENCE_DIR / "services.json"
+        if json_path.exists():
+            json_path.unlink()  # xlsx becomes the active catalogue
+    else:
+        raise HTTPException(status_code=400, detail="ожидается файл .xlsx или .json")
+    rows = len(load_reference_rows(dest))
+    if rows == 0:
+        raise HTTPException(status_code=400, detail="не удалось прочитать услуги из файла")
+    _invalidate_ref_index()
+    return {"rows": rows, "file": dest.name}
+
+
+class DocumentItem(BaseModel):
+    doc_id: str
+    partner_id: Optional[str] = None
+    file_name: str
+    file_format: Optional[str] = None
+    effective_date: Optional[str] = None
+    parsed_at: Optional[str] = None
+    parse_status: Optional[str] = None
+    parse_log: Optional[str] = None
+    chunks: Optional[int] = None
+
+
+@app.get(
+    "/documents",
+    response_model=list[DocumentItem],
+    tags=["Загрузка"],
+    summary="Прайс-документы",
+    description="Список обработанных прайс-документов со статусом разбора (pending/processing/done/error/needs_review).",
+)
+def documents(conn: sqlite3.Connection = Depends(get_db)):
+    rows = conn.execute(
+        """
+        SELECT doc_id, partner_id, file_name, file_format, effective_date,
+               parsed_at, parse_status, parse_log, chunks
+        FROM price_documents ORDER BY parsed_at DESC
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@app.get(
+    "/documents/page",
+    tags=["Верификация"],
+    summary="Фрагмент документа (изображение)",
+    description="Рендер страницы исходного PDF или изображение-источник — для очереди верификации.",
+)
+def document_page(file: str = Query(...), page: int = 1):
+    path = UPLOADS_DIR / FsPath(file).name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="исходный файл не сохранён")
+    suffix = path.suffix.lower()
+    if suffix == ".pdf":
+        try:
+            from pdf2image import convert_from_path
+
+            images = convert_from_path(str(path), dpi=120, first_page=page, last_page=page)
+        except Exception as error:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=f"не удалось отрендерить страницу: {error}")
+        if not images:
+            raise HTTPException(status_code=404, detail="страница не найдена")
+        buffer = BytesIO()
+        images[0].save(buffer, format="PNG")
+        return Response(content=buffer.getvalue(), media_type="image/png")
+    if suffix in {".png", ".jpg", ".jpeg"}:
+        return FileResponse(path)
+    raise HTTPException(status_code=415, detail="превью доступно для PDF и изображений; используйте /documents/file")
+
+
+@app.get(
+    "/documents/file",
+    tags=["Верификация"],
+    summary="Скачать исходный документ",
+    description="Отдаёт сохранённый оригинал файла-прайса (для DOCX/XLSX и аудита).",
+)
+def document_file(file: str = Query(...)):
+    path = UPLOADS_DIR / FsPath(file).name
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="исходный файл не сохранён")
+    return FileResponse(path, filename=path.name)
+
+
+class BasketIn(BaseModel):
+    service_ids: list[int] = Field(examples=[[42, 77, 10]])
+    resident: bool = Field(default=True, description="True — цена резидента, False — нерезидента")
+    city: Optional[str] = None
+
+
+class BasketComboItem(BaseModel):
+    ref_service_id: int
+    service_name: Optional[str] = None
+    partner_id: str
+    partner_name: str
+    price: float
+
+
+class BasketClinic(BaseModel):
+    partner_id: str
+    partner_name: str
+    city: Optional[str] = None
+    covered: int
+    total_requested: int
+    total_price: float
+    items: list[dict] = []
+    missing: list[int] = []
+
+
+class BasketResult(BaseModel):
+    requested: list[int]
+    cheapest_total: float
+    cheapest_items: list[BasketComboItem]
+    missing_anywhere: list[int]
+    by_clinic: list[BasketClinic]
+
+
+@app.post(
+    "/basket/optimize",
+    response_model=BasketResult,
+    tags=["Аналитика"],
+    summary="Оптимизатор корзины обследований",
+    description="По набору услуг находит самую дешёвую комбинацию (по каждой услуге) и ранжирует клиники по покрытию и сумме.",
+)
+def basket_optimize(body: BasketIn, conn: sqlite3.Connection = Depends(get_db)):
+    if not body.service_ids:
+        raise HTTPException(status_code=400, detail="нужен хотя бы один service_id")
+    placeholders = ",".join("?" for _ in body.service_ids)
+    clauses = [f"ref_service_id IN ({placeholders})", "is_active = 1"]
+    params: list = list(body.service_ids)
+    if body.city:
+        clauses.append("city = ?")
+        params.append(body.city)
+    price_col = "price_resident" if body.resident else "price_nonresident"
+    rows = conn.execute(
+        f"""
+        SELECT clinic_id AS partner_id, clinic_name AS partner_name, city,
+               ref_service_id, service_name_norm,
+               COALESCE({price_col}, price, price_min) AS price
+        FROM services
+        WHERE {" AND ".join(clauses)} AND COALESCE({price_col}, price, price_min) IS NOT NULL
+        """,
+        params,
+    ).fetchall()
+
+    # cheapest price per (service) globally and per (clinic, service)
+    cheapest_global: dict[int, dict] = {}
+    per_clinic: dict[str, dict] = {}
+    for r in rows:
+        sid, price = r["ref_service_id"], r["price"]
+        if sid not in cheapest_global or price < cheapest_global[sid]["price"]:
+            cheapest_global[sid] = {
+                "ref_service_id": sid, "service_name": r["service_name_norm"],
+                "partner_id": r["partner_id"], "partner_name": r["partner_name"], "price": price,
+            }
+        clinic = per_clinic.setdefault(
+            r["partner_id"],
+            {"partner_id": r["partner_id"], "partner_name": r["partner_name"], "city": r["city"], "services": {}},
+        )
+        existing = clinic["services"].get(sid)
+        if existing is None or price < existing["price"]:
+            clinic["services"][sid] = {"ref_service_id": sid, "service_name": r["service_name_norm"], "price": price}
+
+    cheapest_items = list(cheapest_global.values())
+    cheapest_total = round(sum(item["price"] for item in cheapest_items), 2)
+    missing_anywhere = [sid for sid in body.service_ids if sid not in cheapest_global]
+
+    by_clinic = []
+    for clinic in per_clinic.values():
+        items = list(clinic["services"].values())
+        covered = len(items)
+        by_clinic.append({
+            "partner_id": clinic["partner_id"],
+            "partner_name": clinic["partner_name"],
+            "city": clinic["city"],
+            "covered": covered,
+            "total_requested": len(body.service_ids),
+            "total_price": round(sum(i["price"] for i in items), 2),
+            "items": items,
+            "missing": [sid for sid in body.service_ids if sid not in clinic["services"]],
+        })
+    by_clinic.sort(key=lambda c: (-c["covered"], c["total_price"]))
+
+    return {
+        "requested": body.service_ids,
+        "cheapest_total": cheapest_total,
+        "cheapest_items": cheapest_items,
+        "missing_anywhere": missing_anywhere,
+        "by_clinic": by_clinic,
+    }
+
+
+class GeoClinic(BaseModel):
+    partner_id: str
+    partner_name: str
+    city: Optional[str] = None
+    address: Optional[str] = None
+    lat: float
+    lon: float
+    service_count: int
+
+
+class GeocodeResult(BaseModel):
+    geocoded: int
+    remaining: int
+
+
+@app.get(
+    "/partners/geo",
+    response_model=list[GeoClinic],
+    tags=["Аналитика"],
+    summary="Клиники на карте",
+    description="Клиники с координатами и числом услуг — для гео-карты.",
+)
+def partners_geo(conn: sqlite3.Connection = Depends(get_db)):
+    rows = conn.execute(
+        """
+        SELECT c.clinic_id AS partner_id, c.clinic_name AS partner_name, c.city, c.address,
+               c.lat, c.lon,
+               (SELECT COUNT(*) FROM services s WHERE s.clinic_id = c.clinic_id AND s.is_active = 1) AS service_count
+        FROM clinics c
+        WHERE c.lat IS NOT NULL AND c.lon IS NOT NULL
+        """
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _geocode(query: str) -> Optional[tuple[float, float]]:
+    import urllib.parse
+    import urllib.request
+
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
+        {"q": query, "format": "json", "limit": 1}
+    )
+    request = urllib.request.Request(url, headers={"User-Agent": "MedRate/1.0 (hackathon)"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception:
+        return None
+    return None
+
+
+def _run_geocode() -> None:
+    import time
+
+    conn = db.connect(check_same_thread=False)
+    try:
+        rows = conn.execute(
+            "SELECT clinic_id, clinic_name, city, address FROM clinics "
+            "WHERE lat IS NULL AND (address IS NOT NULL OR city IS NOT NULL)"
+        ).fetchall()
+        for r in rows:
+            query = ", ".join(v for v in (r["address"], r["city"], "Казахстан") if v)
+            coords = _geocode(query)
+            if coords:
+                conn.execute(
+                    "UPDATE clinics SET lat = ?, lon = ? WHERE clinic_id = ?",
+                    (coords[0], coords[1], r["clinic_id"]),
+                )
+                conn.commit()
+            time.sleep(1.1)  # Nominatim usage policy: ≤1 req/sec
+    finally:
+        conn.close()
+
+
+@app.post(
+    "/partners/geocode",
+    response_model=GeocodeResult,
+    tags=["Аналитика"],
+    summary="Геокодировать клиники",
+    description="Определяет координаты клиник по адресу/городу (OpenStreetMap Nominatim) в фоне.",
+)
+def partners_geocode(background: BackgroundTasks, conn: sqlite3.Connection = Depends(get_db)):
+    remaining = conn.execute(
+        "SELECT COUNT(*) FROM clinics WHERE lat IS NULL AND (address IS NOT NULL OR city IS NOT NULL)"
+    ).fetchone()[0]
+    geocoded = conn.execute("SELECT COUNT(*) FROM clinics WHERE lat IS NOT NULL").fetchone()[0]
+    background.add_task(_run_geocode)
+    return {"geocoded": geocoded, "remaining": remaining}
+
+
+@app.get(
+    "/report/quality",
+    tags=["Аналитика"],
+    summary="Отчёт о качестве (Markdown)",
+    description="Генерирует отчёт о качестве обработки (документы, % нормализации, очереди, флаги) — deliverable ТЗ §7.",
+)
+def quality_report(conn: sqlite3.Connection = Depends(get_db)):
+    total = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
+    normalized = conn.execute("SELECT COUNT(*) FROM services WHERE service_name_norm IS NOT NULL").fetchone()[0]
+    verified = conn.execute("SELECT COUNT(*) FROM services WHERE is_verified = 1").fetchone()[0]
+    partners = conn.execute("SELECT COUNT(DISTINCT clinic_id) FROM services").fetchone()[0]
+    unmatched = conn.execute("SELECT COUNT(*) FROM unmatched_queue").fetchone()[0]
+    docs = conn.execute(
+        "SELECT parse_status, COUNT(*) n FROM price_documents GROUP BY parse_status"
+    ).fetchall()
+    doc_total = sum(d["n"] for d in docs)
+
+    flag_counts: dict[str, int] = {}
+    for (value,) in conn.execute("SELECT flags FROM services WHERE flags IS NOT NULL AND flags != '[]'"):
+        for flag in _flags(value):
+            flag_counts[flag] = flag_counts.get(flag, 0) + 1
+
+    by_clinic = conn.execute(
+        """
+        SELECT clinic_name, COUNT(*) n, SUM(service_name_norm IS NOT NULL) norm
+        FROM services GROUP BY clinic_id, clinic_name ORDER BY n DESC
+        """
+    ).fetchall()
+
+    pct = round(100 * normalized / total, 1) if total else 0
+    lines = [
+        "# MedRate — отчёт о качестве обработки",
+        "",
+        f"_Сгенерировано: {db.now_iso()}_",
+        "",
+        "## Сводка",
+        "",
+        f"- Прайс-документов обработано: **{doc_total}**",
+        f"- Позиций прайсов: **{total}**",
+        f"- Нормализовано (привязано к справочнику): **{normalized}** (**{pct}%**)"
+        + ("  ✅ цель MVP ≥70%" if pct >= 70 else "  ⚠️ цель MVP — 70%"),
+        f"- Верифицировано оператором: **{verified}**",
+        f"- В очереди сопоставления (unmatched): **{unmatched}**",
+        f"- Клиник-партнёров: **{partners}**",
+        "",
+        "## Документы по статусу разбора",
+        "",
+        "| Статус | Документов |",
+        "|---|---|",
+        *[f"| {d['parse_status']} | {d['n']} |" for d in docs],
+        "",
+        "## Флаги качества",
+        "",
+        "| Флаг | Количество |",
+        "|---|---|",
+        *[f"| {flag} | {n} |" for flag, n in sorted(flag_counts.items(), key=lambda kv: -kv[1])],
+        "",
+        "## Покрытие по клиникам",
+        "",
+        "| Клиника | Позиций | Нормализовано |",
+        "|---|---|---|",
+        *[f"| {c['clinic_name']} | {c['n']} | {c['norm']} |" for c in by_clinic],
+        "",
+    ]
+    content = "\n".join(lines)
+    return Response(
+        content=content,
+        media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename="medrate_quality_report.md"'},
+    )
+
+
 @app.get(
     "/stats",
     response_model=Stats,
@@ -477,8 +993,7 @@ def match(body: MatchIn):
     summary="Метрики обработки",
     description="Количество позиций, доля нормализованных, число партнёров и размер очереди.",
 )
-def stats():
-    conn = _conn()
+def stats(conn: sqlite3.Connection = Depends(get_db)):
     total = conn.execute("SELECT COUNT(*) FROM services").fetchone()[0]
     normalized = conn.execute("SELECT COUNT(*) FROM services WHERE service_name_norm IS NOT NULL").fetchone()[0]
     verified = conn.execute("SELECT COUNT(*) FROM services WHERE is_verified = 1").fetchone()[0]
@@ -512,8 +1027,7 @@ def stats():
     summary="Опции фильтров",
     description="Города, категории (с русскими подписями) и клиники для выпадающих списков UI.",
 )
-def filters():
-    conn = _conn()
+def filters(conn: sqlite3.Connection = Depends(get_db)):
     cities = queries.distinct_values(conn, "city")
     present = queries.distinct_values(conn, "category")
     categories = [
@@ -535,8 +1049,8 @@ def filters():
     summary="История цен услуги",
     description="Цены по годам для услуги справочника, сгруппированные по клинике — для графика истории.",
 )
-def service_history(ref_service_id: int = Path(examples=[42])):
-    rows = _conn().execute(
+def service_history(ref_service_id: int = Path(examples=[42]), conn: sqlite3.Connection = Depends(get_db)):
+    rows = conn.execute(
         f"""
         SELECT clinic_id AS partner_id, clinic_name AS partner_name,
                source_year, {PRICE} AS price, is_active, service_name_norm
@@ -567,6 +1081,7 @@ def service_history(ref_service_id: int = Path(examples=[42])):
 def verification_queue(
     flag: Optional[str] = Query(default=None, description="фильтр по флагу, напр. price_anomaly"),
     limit: int = 200,
+    conn: sqlite3.Connection = Depends(get_db),
 ):
     clauses = ["is_verified = 0"]
     params: list = []
@@ -574,7 +1089,7 @@ def verification_queue(
         clauses.append("flags LIKE ?")
         params.append(f'%"{flag}"%')
     where = " AND ".join(clauses)
-    rows = _conn().execute(
+    rows = conn.execute(
         f"""
         SELECT record_id, clinic_id, clinic_name, service_name_raw, service_name_norm,
                ref_service_id, category, {PRICE} AS price, price_resident, price_nonresident,
@@ -595,8 +1110,7 @@ def verification_queue(
     summary="Верифицировать позицию",
     description="Подтвердить (approve), отклонить (reject) или исправить (correct) позицию прайса.",
 )
-def verify(body: VerifyIn):
-    conn = _conn()
+def verify(body: VerifyIn, conn: sqlite3.Connection = Depends(get_db)):
     row = conn.execute(
         "SELECT is_active FROM services WHERE record_id = ?", (body.record_id,)
     ).fetchone()

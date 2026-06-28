@@ -6,12 +6,24 @@ import { api, Stats } from "@/lib/api";
 import { flagLabel, isCriticalFlag } from "@/lib/format";
 import StatCard from "@/components/StatCard";
 
+type DocRow = Awaited<ReturnType<typeof api.documents>>[number];
+
+const DOC_STATUS: Record<string, { label: string; cls: string }> = {
+  done: { label: "готово", cls: "bg-teal-50 text-teal-700" },
+  needs_review: { label: "на ревью", cls: "bg-amber-50 text-amber-700" },
+  processing: { label: "обработка", cls: "bg-blue-50 text-blue-700" },
+  error: { label: "ошибка", cls: "bg-red-50 text-red-600" },
+  pending: { label: "в очереди", cls: "bg-slate-100 text-slate-500" },
+};
+
 export default function AdminDashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
+  const [docs, setDocs] = useState<DocRow[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     api.stats().then(setStats).catch((e) => setError(String(e)));
+    api.documents().then(setDocs).catch(() => setDocs([]));
   }, []);
 
   if (error)
@@ -35,14 +47,24 @@ export default function AdminDashboard() {
 
   return (
     <div className="mx-auto max-w-5xl px-4 py-8">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <h1 className="text-2xl font-bold text-slate-900">Кабинет оператора</h1>
-        <Link
-          href="/admin/upload"
-          className="rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-700"
-        >
-          + Загрузить прайсы
-        </Link>
+        <div className="flex gap-2">
+          <a
+            href={api.reportUrl()}
+            target="_blank"
+            rel="noreferrer"
+            className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 hover:bg-slate-100"
+          >
+            ↓ Отчёт о качестве
+          </a>
+          <Link
+            href="/admin/upload"
+            className="rounded-lg bg-teal-600 px-4 py-2 text-sm font-semibold text-white hover:bg-teal-700"
+          >
+            + Загрузить прайсы
+          </Link>
+        </div>
       </div>
 
       <div className="mt-6 grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
@@ -120,6 +142,46 @@ export default function AdminDashboard() {
             </div>
           )}
         </div>
+      </div>
+
+      {/* Price documents */}
+      <div className="mt-6 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+        <h2 className="mb-3 text-lg font-semibold text-slate-800">
+          Прайс-документы <span className="text-sm font-normal text-slate-400">({docs.length})</span>
+        </h2>
+        {docs.length === 0 ? (
+          <p className="text-sm text-slate-400">Документов нет — загрузите архив.</p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead className="text-left text-xs uppercase tracking-wide text-slate-400">
+              <tr>
+                <th className="py-1">Файл</th>
+                <th className="py-1">Формат</th>
+                <th className="py-1">Партнёр</th>
+                <th className="py-1">Чанков</th>
+                <th className="py-1">Статус</th>
+                <th className="py-1">Лог</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {docs.map((d) => {
+                const s = DOC_STATUS[d.parse_status ?? ""] ?? { label: d.parse_status ?? "—", cls: "bg-slate-100 text-slate-500" };
+                return (
+                  <tr key={d.doc_id}>
+                    <td className="py-1.5 text-slate-700">{d.file_name}</td>
+                    <td className="py-1.5 text-slate-500">{d.file_format}</td>
+                    <td className="py-1.5 text-slate-500">{d.partner_id}</td>
+                    <td className="py-1.5 text-slate-500">{d.chunks ?? "—"}</td>
+                    <td className="py-1.5">
+                      <span className={`rounded px-1.5 py-0.5 text-xs ${s.cls}`}>{s.label}</span>
+                    </td>
+                    <td className="py-1.5 text-slate-400">{d.parse_log}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
 
       {/* Ingest log */}

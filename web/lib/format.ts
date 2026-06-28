@@ -40,6 +40,7 @@ export const FLAG_LABELS: Record<string, string> = {
   non_price_row: "не цена",
   unmatched_service: "нет в справочнике",
   kzt_converted_from_usd: "конверт. из USD",
+  kzt_converted_from_rub: "конверт. из RUB",
   invalid_price: "некорректная цена",
   nonresident_below_resident: "нерезидент < резидент",
   future_date: "дата в будущем",

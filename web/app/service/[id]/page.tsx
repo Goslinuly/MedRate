@@ -53,6 +53,29 @@ export default function ServicePage() {
             {partners.length} клиник · отсортировано от самой выгодной цены
           </p>
 
+          {data.market && data.market.count >= 2 && (
+            <div className="mt-4 grid grid-cols-2 gap-3 rounded-xl bg-white p-4 shadow-sm ring-1 ring-slate-200 sm:grid-cols-4">
+              <div>
+                <div className="text-xs text-slate-400">медиана рынка</div>
+                <div className="text-lg font-bold text-slate-900">{formatPrice(data.market.median)} ₸</div>
+              </div>
+              <div>
+                <div className="text-xs text-slate-400">25–75 перцентиль</div>
+                <div className="text-sm font-medium text-slate-700">
+                  {formatPrice(data.market.p25)} – {formatPrice(data.market.p75)} ₸
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-slate-400">минимум</div>
+                <div className="text-sm font-medium text-teal-700">{formatPrice(data.market.min)} ₸</div>
+              </div>
+              <div>
+                <div className="text-xs text-slate-400">максимум</div>
+                <div className="text-sm font-medium text-slate-700">{formatPrice(data.market.max)} ₸</div>
+              </div>
+            </div>
+          )}
+
           <div className="mt-5 overflow-hidden rounded-xl bg-white shadow-sm ring-1 ring-slate-200">
             <table className="w-full text-sm">
               <thead className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-400">
@@ -67,7 +90,10 @@ export default function ServicePage() {
                 {partners.map((p) => {
                   const best = (p.price_resident ?? p.price) === cheapest;
                   return (
-                    <tr key={p.partner_id + p.service_name_raw} className={best ? "bg-teal-50/50" : ""}>
+                    <tr
+                      key={p.partner_id + p.service_name_raw}
+                      className={p.is_outlier ? "bg-red-50/60" : best ? "bg-teal-50/50" : ""}
+                    >
                       <td className="px-4 py-3">
                         <Link
                           href={`/clinic/${p.partner_id}`}
@@ -89,6 +115,22 @@ export default function ServicePage() {
                           fallback={p.price}
                         />
                         {p.unit && <div className="mt-0.5 text-xs text-slate-400">за {p.unit}</div>}
+                        {p.delta_pct != null && p.delta_pct !== 0 && (
+                          <div
+                            className={`mt-1 inline-block rounded px-1.5 py-0.5 text-[11px] font-medium ${
+                              p.delta_pct < 0
+                                ? "bg-teal-50 text-teal-700"
+                                : p.is_outlier
+                                  ? "bg-red-100 text-red-700"
+                                  : "bg-amber-50 text-amber-700"
+                            }`}
+                          >
+                            {p.delta_pct < 0
+                              ? `дешевле рынка на ${Math.abs(p.delta_pct)}%`
+                              : `дороже рынка на ${p.delta_pct}%`}
+                            {p.is_outlier ? " · выброс" : ""}
+                          </div>
+                        )}
                       </td>
                       <td className="px-4 py-3 text-slate-600">
                         <div>{p.service_name_raw}</div>

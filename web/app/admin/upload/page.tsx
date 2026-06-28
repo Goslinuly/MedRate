@@ -4,6 +4,56 @@ import { useCallback, useRef, useState } from "react";
 import Link from "next/link";
 import { api } from "@/lib/api";
 
+function ReferenceUpload() {
+  const ref = useRef<HTMLInputElement>(null);
+  const [msg, setMsg] = useState<string | null>(null);
+  const [err, setErr] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const upload = async (file: File | undefined) => {
+    if (!file) return;
+    setBusy(true);
+    setErr(null);
+    setMsg(null);
+    try {
+      const res = await api.referenceUpload(file);
+      setMsg(`Справочник загружен: ${res.rows} услуг (${res.file})`);
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="mt-6 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">
+      <h2 className="text-lg font-semibold text-slate-800">Справочник услуг</h2>
+      <p className="mt-1 text-sm text-slate-500">
+        Загрузите целевой справочник в формате <b>XLSX</b> или <b>JSON</b> (поддерживаются колонки
+        synonyms, category). Заменяет текущий справочник.
+      </p>
+      <div className="mt-3 flex items-center gap-3">
+        <button
+          disabled={busy}
+          onClick={() => ref.current?.click()}
+          className="rounded-lg border border-slate-300 px-4 py-2 text-sm font-medium hover:bg-slate-100 disabled:opacity-50"
+        >
+          {busy ? "Загрузка…" : "Выбрать файл справочника"}
+        </button>
+        <input
+          ref={ref}
+          type="file"
+          accept=".xlsx,.json"
+          className="hidden"
+          onChange={(e) => upload(e.target.files?.[0])}
+        />
+      </div>
+      {msg && <div className="mt-3 rounded-lg bg-teal-50 px-3 py-2 text-sm text-teal-700">{msg}</div>}
+      {err && <div className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">{err}</div>}
+    </div>
+  );
+}
+
 type JobState = {
   state: string;
   files?: number;
@@ -127,6 +177,8 @@ export default function UploadPage() {
       {error && (
         <div className="mt-4 rounded-xl bg-red-50 p-4 text-red-700 ring-1 ring-red-200">{error}</div>
       )}
+
+      <ReferenceUpload />
 
       {job && (
         <div className="mt-6 rounded-xl bg-white p-5 shadow-sm ring-1 ring-slate-200">

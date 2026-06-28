@@ -5,7 +5,9 @@ import { usePathname } from "next/navigation";
 
 const PUBLIC_LINKS = [
   { href: "/", label: "Поиск услуг" },
+  { href: "/basket", label: "Корзина" },
   { href: "/partners", label: "Клиники" },
+  { href: "/map", label: "Карта" },
 ];
 
 const ADMIN_LINKS = [

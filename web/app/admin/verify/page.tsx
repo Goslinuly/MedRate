@@ -5,6 +5,49 @@ import { api, VerificationItem } from "@/lib/api";
 import { formatPrice } from "@/lib/format";
 import { FlagList } from "@/components/FlagTag";
 
+function SourcePreview({ item }: { item: VerificationItem }) {
+  const [open, setOpen] = useState(false);
+  const [failed, setFailed] = useState(false);
+  if (!item.source_file) return null;
+  const isImageLike = /\.(pdf|png|jpe?g)$/i.test(item.source_file);
+
+  return (
+    <div className="mt-3">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="text-sm font-medium text-teal-700 hover:underline"
+      >
+        {open ? "Скрыть источник" : "Показать фрагмент источника"} ↓
+      </button>
+      {open && (
+        <div className="mt-2 rounded-lg border border-slate-200 bg-slate-50 p-2">
+          {isImageLike && !failed ? (
+            <img
+              src={api.documentPageUrl(item.source_file, item.source_page ?? 1)}
+              alt={`${item.source_file} стр. ${item.source_page ?? 1}`}
+              className="max-h-96 w-auto rounded border border-slate-200"
+              onError={() => setFailed(true)}
+            />
+          ) : (
+            <a
+              href={api.documentFileUrl(item.source_file)}
+              target="_blank"
+              rel="noreferrer"
+              className="text-sm text-teal-700 underline"
+            >
+              Скачать исходный файл: {item.source_file}
+            </a>
+          )}
+          <div className="mt-1 text-xs text-slate-400">
+            {item.source_file}
+            {item.source_page ? ` · стр. ${item.source_page}` : ""}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function VerifyPage() {
   const [items, setItems] = useState<VerificationItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -118,6 +161,8 @@ function VerifyCard({
           {item.verification_note}
         </div>
       )}
+
+      <SourcePreview item={item} />
 
       <div className="mt-3 flex flex-wrap items-center gap-4">
         {!editing ? (

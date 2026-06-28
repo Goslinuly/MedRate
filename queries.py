@@ -3,8 +3,6 @@ from typing import Optional
 
 import pandas as pd
 
-from config import REFERENCE_FILE
-
 SORT_OPTIONS = {
     "Цена ↑": "price_sort ASC",
     "Цена ↓": "price_sort DESC",
@@ -165,8 +163,9 @@ def price_history(conn: sqlite3.Connection, clinic_id: str, service_name_norm: s
 
 
 def reference_terms() -> list[str]:
-    df = pd.read_excel(REFERENCE_FILE)
-    return sorted({str(name).strip() for name in df["Name_ru"].dropna()})
+    from pipeline.normalize import load_reference_rows
+
+    return sorted({row["name"] for row in load_reference_rows() if row["name"]})
 
 
 def export_dataframe(conn: sqlite3.Connection) -> pd.DataFrame:

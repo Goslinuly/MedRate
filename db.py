@@ -13,7 +13,27 @@ CREATE TABLE IF NOT EXISTS clinics (
     city          TEXT,
     address       TEXT,
     phone         TEXT,
-    working_hours TEXT
+    working_hours TEXT,
+    bin           TEXT,
+    contact_email TEXT,
+    contact_phone TEXT,
+    lat           REAL,
+    lon           REAL,
+    is_active     INTEGER DEFAULT 1,
+    created_at    TEXT,
+    updated_at    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS price_documents (
+    doc_id      TEXT PRIMARY KEY,
+    partner_id  TEXT,
+    file_name   TEXT,
+    file_format TEXT,
+    effective_date TEXT,
+    parsed_at   TEXT,
+    parse_status TEXT,
+    parse_log   TEXT,
+    chunks      INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS services (
@@ -88,6 +108,14 @@ CREATE TABLE IF NOT EXISTS llm_cache (
     created_at TEXT
 );
 
+CREATE TABLE IF NOT EXISTS reference_extra (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    name       TEXT UNIQUE,
+    category   TEXT,
+    specialty  TEXT,
+    created_at TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_services_norm ON services(service_name_norm);
 CREATE INDEX IF NOT EXISTS idx_services_clinic ON services(clinic_id);
 CREATE INDEX IF NOT EXISTS idx_services_category ON services(category);
@@ -99,7 +127,7 @@ def now_iso() -> str:
 
 
 def connect(path: Path = DB_PATH, check_same_thread: bool = True) -> sqlite3.Connection:
-    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread)
+    conn = sqlite3.connect(str(path), check_same_thread=check_same_thread, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.create_function("ulower", 1, lambda value: value.lower() if value else value)
     conn.execute("PRAGMA journal_mode=WAL")
@@ -114,6 +142,19 @@ ADDED_SERVICE_COLUMNS = {
     "currency_original": "TEXT",
     "is_verified": "INTEGER DEFAULT 0",
     "verification_note": "TEXT",
+    "service_code_source": "TEXT",
+    "effective_date": "TEXT",
+}
+
+ADDED_CLINIC_COLUMNS = {
+    "bin": "TEXT",
+    "contact_email": "TEXT",
+    "contact_phone": "TEXT",
+    "lat": "REAL",
+    "lon": "REAL",
+    "is_active": "INTEGER DEFAULT 1",
+    "created_at": "TEXT",
+    "updated_at": "TEXT",
 }
 
 
@@ -124,23 +165,35 @@ def init_db(conn: sqlite3.Connection) -> None:
 
 
 def _migrate(conn: sqlite3.Connection) -> None:
-    existing = {row["name"] for row in conn.execute("PRAGMA table_info(services)")}
-    for column, decl in ADDED_SERVICE_COLUMNS.items():
+    _add_columns(conn, "services", ADDED_SERVICE_COLUMNS)
+    _add_columns(conn, "clinics", ADDED_CLINIC_COLUMNS)
+
+
+def _add_columns(conn: sqlite3.Connection, table: str, columns: dict[str, str]) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for column, decl in columns.items():
         if column not in existing:
-            conn.execute(f"ALTER TABLE services ADD COLUMN {column} {decl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
+    now = now_iso()
     conn.execute(
         """
-        INSERT INTO clinics (clinic_id, clinic_name, city, address, phone, working_hours)
-        VALUES (:clinic_id, :clinic_name, :city, :address, :phone, :working_hours)
+        INSERT INTO clinics (clinic_id, clinic_name, city, address, phone, working_hours,
+                             bin, contact_email, contact_phone, is_active, created_at, updated_at)
+        VALUES (:clinic_id, :clinic_name, :city, :address, :phone, :working_hours,
+                :bin, :contact_email, :contact_phone, 1, :now, :now)
         ON CONFLICT(clinic_id) DO UPDATE SET
             clinic_name=COALESCE(excluded.clinic_name, clinic_name),
             city=COALESCE(excluded.city, city),
             address=COALESCE(excluded.address, address),
             phone=COALESCE(excluded.phone, phone),
-            working_hours=COALESCE(excluded.working_hours, working_hours)
+            working_hours=COALESCE(excluded.working_hours, working_hours),
+            bin=COALESCE(excluded.bin, bin),
+            contact_email=COALESCE(excluded.contact_email, contact_email),
+            contact_phone=COALESCE(excluded.contact_phone, contact_phone),
+            updated_at=excluded.updated_at
         """,
         {
             "clinic_id": clinic.get("clinic_id"),
@@ -149,6 +202,36 @@ def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
             "address": clinic.get("address"),
             "phone": clinic.get("phone"),
             "working_hours": clinic.get("working_hours"),
+            "bin": clinic.get("bin"),
+            "contact_email": clinic.get("contact_email"),
+            "contact_phone": clinic.get("contact_phone"),
+            "now": now,
+        },
+    )
+
+
+def upsert_document(conn: sqlite3.Connection, doc: dict[str, Any]) -> None:
+    conn.execute(
+        """
+        INSERT INTO price_documents
+            (doc_id, partner_id, file_name, file_format, effective_date, parsed_at, parse_status, parse_log, chunks)
+        VALUES (:doc_id, :partner_id, :file_name, :file_format, :effective_date, :parsed_at, :parse_status, :parse_log, :chunks)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            parse_status=excluded.parse_status,
+            parse_log=excluded.parse_log,
+            parsed_at=excluded.parsed_at,
+            chunks=excluded.chunks
+        """,
+        {
+            "doc_id": doc.get("doc_id"),
+            "partner_id": doc.get("partner_id"),
+            "file_name": doc.get("file_name"),
+            "file_format": doc.get("file_format"),
+            "effective_date": doc.get("effective_date"),
+            "parsed_at": doc.get("parsed_at") or now_iso(),
+            "parse_status": doc.get("parse_status"),
+            "parse_log": doc.get("parse_log"),
+            "chunks": doc.get("chunks"),
         },
     )
 
@@ -156,10 +239,11 @@ def upsert_clinic(conn: sqlite3.Connection, clinic: dict[str, Any]) -> None:
 SERVICE_COLUMNS = [
     "clinic_id", "clinic_name", "city", "address", "phone", "working_hours",
     "service_name_raw", "service_name_norm", "service_name_kz", "ref_service_id",
-    "category", "price", "price_min", "price_max", "price_resident", "price_nonresident",
+    "service_code_source", "category", "price", "price_min", "price_max",
+    "price_resident", "price_nonresident",
     "price_original", "currency", "currency_original", "unit",
     "duration_days", "source_file", "source_page", "source_year", "source_url",
-    "parsed_at", "is_active", "is_verified", "verification_note",
+    "effective_date", "parsed_at", "is_active", "is_verified", "verification_note",
     "confidence", "flags", "notes", "dedup_key",
 ]
 
@@ -227,8 +311,40 @@ def cache_set(conn: sqlite3.Connection, cache_key: str, payload: Any) -> None:
     conn.commit()
 
 
+REFERENCE_EXTRA_ID_OFFSET = 1_000_000
+
+
+def add_reference(conn: sqlite3.Connection, name: str, category: str = "", specialty: str = "") -> int:
+    """Create an operator-defined catalogue entry; returns a stable ref_service_id."""
+    cur = conn.execute(
+        """
+        INSERT INTO reference_extra (name, category, specialty, created_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET category=excluded.category, specialty=excluded.specialty
+        """,
+        (name.strip(), category, specialty, now_iso()),
+    )
+    conn.commit()
+    row = conn.execute("SELECT id FROM reference_extra WHERE name = ?", (name.strip(),)).fetchone()
+    return REFERENCE_EXTRA_ID_OFFSET + (row["id"] if row else cur.lastrowid)
+
+
+def reference_extra_rows(conn: sqlite3.Connection) -> list[dict]:
+    rows = conn.execute("SELECT id, name, category, specialty FROM reference_extra").fetchall()
+    return [
+        {
+            "id": REFERENCE_EXTRA_ID_OFFSET + r["id"],
+            "name": r["name"],
+            "category": r["category"] or "",
+            "specialty": r["specialty"] or "",
+            "synonyms": [],
+        }
+        for r in rows
+    ]
+
+
 def clear_pipeline_tables(conn: sqlite3.Connection) -> None:
-    for table in ("services", "clinics", "unmatched_queue", "ingest_log", "raw_extractions"):
+    for table in ("services", "clinics", "unmatched_queue", "ingest_log", "raw_extractions", "price_documents"):
         conn.execute(f"DELETE FROM {table}")
     conn.commit()
 

@@ -1,11 +1,12 @@
+import json
 import re
-from functools import lru_cache
+from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 from rapidfuzz import fuzz, process
 
-from config import CATEGORIES, LLM_TIEBREAK, REFERENCE_FILE, USD_KZT_RATE
+from config import CATEGORIES, CURRENCY_RATES, LLM_TIEBREAK, REFERENCE_DIR, REFERENCE_FILE
 from pipeline import llm
 
 EXACT_CONFIDENCE = 0.97
@@ -45,23 +46,101 @@ def normalize_text(value: str) -> str:
     return " ".join(tokens)
 
 
+def _split_synonyms(value) -> list[str]:
+    if isinstance(value, list):
+        return [str(s).strip() for s in value if str(s).strip()]
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return []
+    return [part.strip() for part in re.split(r"[;,|/]", str(value)) if part.strip()]
+
+
+def _find_column(columns, *candidates) -> Optional[str]:
+    lookup = {str(c).strip().lower(): c for c in columns}
+    for candidate in candidates:
+        if candidate.lower() in lookup:
+            return lookup[candidate.lower()]
+    return None
+
+
+def active_reference_path() -> Path:
+    """The catalogue currently in force — an uploaded JSON takes priority over the XLSX."""
+    json_path = REFERENCE_DIR / "services.json"
+    if json_path.exists():
+        return json_path
+    return REFERENCE_FILE
+
+
+def load_reference_rows(path: Optional[Path] = None) -> list[dict]:
+    """Load the target catalogue from XLSX or JSON into a uniform row shape.
+
+    Supported optional columns/keys: synonyms, category, specialty/icd.
+    """
+    path = Path(path) if path is not None else active_reference_path()
+    if not path.exists():
+        return []
+    if path.suffix.lower() == ".json":
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        items = raw if isinstance(raw, list) else raw.get("services", [])
+        rows = []
+        for index, item in enumerate(items):
+            name = str(item.get("service_name") or item.get("name") or "").strip()
+            if not name:
+                continue
+            sid = item.get("service_id", index)
+            rows.append({
+                "id": int(sid) if str(sid).isdigit() else index,
+                "name": name,
+                "specialty": str(item.get("specialty") or "").strip(),
+                "category": str(item.get("category") or "").strip().lower(),
+                "synonyms": _split_synonyms(item.get("synonyms")),
+            })
+        return rows
+
+    df = pd.read_excel(path)
+    name_col = _find_column(df.columns, "Name_ru", "service_name", "name", "наименование")
+    syn_col = _find_column(df.columns, "synonyms", "синонимы")
+    cat_col = _find_column(df.columns, "category", "категория")
+    spec_col = _find_column(df.columns, "Специальность", "specialty", "специальность")
+    if name_col is None:
+        return []
+    rows = []
+    for ref_id, row in df.iterrows():
+        name = str(row[name_col]).strip()
+        if not name or name.lower() == "nan":
+            continue
+        rows.append({
+            "id": int(ref_id),
+            "name": name,
+            "specialty": str(row[spec_col]).strip() if spec_col else "",
+            "category": str(row[cat_col]).strip().lower() if cat_col else "",
+            "synonyms": _split_synonyms(row[syn_col]) if syn_col else [],
+        })
+    return rows
+
+
 class ReferenceIndex:
-    def __init__(self, df: pd.DataFrame):
+    def __init__(self, rows: list[dict]):
         self.entries: list[dict] = []
         self._exact: dict[str, int] = {}
-        for ref_id, row in df.iterrows():
-            name = str(row["Name_ru"]).strip()
+        for row in rows:
+            name = str(row["name"]).strip()
             if not name:
                 continue
             norm = normalize_text(name)
             entry = {
-                "id": int(ref_id),
+                "id": int(row["id"]),
                 "name": name,
-                "specialty": str(row.get("Специальность") or "").strip(),
+                "specialty": row.get("specialty", ""),
+                "category": row.get("category", ""),
+                "synonyms": row.get("synonyms", []),
                 "norm": norm,
             }
             self.entries.append(entry)
             self._exact.setdefault(norm, entry["id"])
+            for synonym in entry["synonyms"]:
+                syn_norm = normalize_text(synonym)
+                if syn_norm:
+                    self._exact.setdefault(syn_norm, entry["id"])
         self._choices = {entry["id"]: entry["norm"] for entry in self.entries}
         self._by_id = {entry["id"]: entry for entry in self.entries}
 
@@ -74,14 +153,23 @@ class ReferenceIndex:
         )
         return [(self._by_id[ref_id], score) for _, score, ref_id in matches]
 
+    def search(self, query: str, limit: int = 20) -> list[dict]:
+        norm = normalize_text(query)
+        if not norm:
+            return []
+        matches = process.extract(norm, self._choices, scorer=fuzz.token_set_ratio, limit=limit)
+        return [self._by_id[ref_id] for _, score, ref_id in matches if score > 50]
+
     def get(self, ref_id: int) -> dict:
         return self._by_id[ref_id]
 
 
-@lru_cache(maxsize=1)
-def build_ref_index() -> ReferenceIndex:
-    df = pd.read_excel(REFERENCE_FILE)
-    return ReferenceIndex(df)
+def build_ref_index(conn=None) -> ReferenceIndex:
+    rows = load_reference_rows()
+    if conn is not None:
+        from db import reference_extra_rows
+        rows = rows + reference_extra_rows(conn)
+    return ReferenceIndex(rows)
 
 
 def _to_number(token: str) -> Optional[float]:
@@ -102,6 +190,8 @@ def _detect_currency(raw: str, currency_raw: Optional[str]) -> tuple[str, list[s
     blob = f"{raw} {currency_raw or ''}".lower()
     if "$" in blob or "usd" in blob or "долл" in blob:
         return "USD", []
+    if "₽" in blob or "rub" in blob or "руб" in blob or "рос" in blob:
+        return "RUB", []
     if any(token in blob for token in ("kzt", "тг", "тенге", "₸")):
         return "KZT", []
     return "KZT", ["currency_assumed"]
@@ -141,11 +231,12 @@ def parse_price(raw: Optional[str], currency_raw: Optional[str] = None) -> dict:
 
     result["currency_original"] = currency
     result["price_original"] = result["price"] if result["price"] is not None else result["price_min"]
-    if currency == "USD":
+    if currency in CURRENCY_RATES:
+        rate = CURRENCY_RATES[currency]
         for key in ("price", "price_min", "price_max"):
             if result[key] is not None:
-                result[key] = round(result[key] * USD_KZT_RATE, 2)
-        result["flags"].append("kzt_converted_from_usd")
+                result[key] = round(result[key] * rate, 2)
+        result["flags"].append(f"kzt_converted_from_{currency.lower()}")
     result["currency"] = "KZT"
     return result
 
@@ -196,9 +287,11 @@ def _safe_match(service_name_raw: str, candidates: list[dict], conn) -> dict:
 
 
 def _matched(entry: dict, confidence: float) -> dict:
+    category = entry.get("category") or ""
     return {
         "service_name_norm": entry["name"],
         "ref_service_id": entry["id"],
+        "category": category if category in VALID_CATEGORIES else None,
         "confidence": confidence,
         "flags": [],
         "candidates": [],
@@ -209,6 +302,7 @@ def _unmatched(candidates: list[dict]) -> dict:
     return {
         "service_name_norm": None,
         "ref_service_id": None,
+        "category": None,
         "confidence": 0.0,
         "flags": ["unmatched_service"],
         "candidates": candidates,
